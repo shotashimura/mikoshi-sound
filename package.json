@@ -1,0 +1,17 @@
+{
+  "name": "mikoshi-sound",
+  "version": "1.0.0",
+  "description": "神輿リアルタイム環境音響システム",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "qrcode": "^1.5.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

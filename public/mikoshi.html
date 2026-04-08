@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <title>神輿</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+
+    /* カメラ映像のみ。UIは一切なし */
+    #cam {
+      position: fixed; inset: 0;
+      width: 100%; height: 100%;
+      object-fit: cover;
+    }
+
+    /* タップ開始画面だけ例外 */
+    #start-screen {
+      position: fixed; inset: 0; z-index: 100;
+      background: #000;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 1.5rem;
+      cursor: pointer; -webkit-tap-highlight-color: transparent;
+    }
+    #start-screen .kanji {
+      font-size: 5rem; color: rgba(255,220,100,0.85); font-family: serif;
+    }
+    #start-screen .hint {
+      font-size: 0.8rem; color: rgba(255,220,100,0.3);
+      font-family: sans-serif; letter-spacing: 0.35em;
+      animation: blink 2.5s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.1} }
+
+    /* 解析用・キャプチャ用canvas（非表示） */
+    #analysis-canvas, #capture-canvas { display: none; }
+  </style>
+</head>
+<body>
+  <video id="cam" autoplay muted playsinline></video>
+
+  <!-- 解析専用（80x60） -->
+  <canvas id="analysis-canvas" width="80" height="60"></canvas>
+  <!-- 送信専用（320x240） -->
+  <canvas id="capture-canvas"  width="320" height="240"></canvas>
+
+  <div id="start-screen">
+    <div class="kanji">神輿</div>
+    <div class="hint">タップして開始</div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+  'use strict';
+
+  // ============================================================
+  //  センサー状態
+  // ============================================================
+  const S = {
+    brightness: 0.5,
+    whiteRatio:  0.3,
+    colorTemp:   0.5,   // 0=cool  1=warm
+    accMag:      0,
+    accX: 0, accY: 0,
+    mic:         0,
+  };
+  let voiceIndex = 0;
+  let audienceCount = 0;
+  let audioReady = false;
+
+  // ============================================================
+  //  Socket.io
+  // ============================================================
+  const socket = io();
+  socket.on('joined_mikoshi', (d) => { voiceIndex = d.voiceIndex; });
+  socket.on('world_state', (s) => {
+    audienceCount = s.audienceCount;
+    if (audioReady) applyWorldToAudio(s);
+  });
+
+  setInterval(() => {
+    if (!audioReady) return;
+    socket.emit('sensor_data', {
+      brightness:    S.brightness,
+      whiteRatio:    S.whiteRatio,
+      colorTemp:     S.colorTemp,
+      accMagnitude:  S.accMag,
+      accX: S.accX,  accY: S.accY,
+      micLevel:      S.mic,
+    });
+  }, 150);
+
+  // ============================================================
+  //  タップで全開始
+  // ============================================================
+  document.getElementById('start-screen').addEventListener('pointerdown', async () => {
+    document.getElementById('start-screen').remove();
+    socket.emit('join_mikoshi');
+    await initCamera();
+    await initMic();
+    await initMotion();   // iOS permission
+    await initAudio();
+    startVideoCapture();
+    audioReady = true;
+  }, { once: true });
+
+  // ============================================================
+  //  カメラ（解析専用 canvas — 80x60）
+  // ============================================================
+  const camEl       = document.getElementById('cam');
+  const anvCanvas   = document.getElementById('analysis-canvas');
+  const anvCtx      = anvCanvas.getContext('2d', { willReadFrequently: true });
+
+  async function initCamera() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+      camEl.srcObject = stream;
+      await new Promise((r) => { camEl.onloadedmetadata = r; });
+    } catch (e) { console.warn('camera:', e); }
+  }
+
+  function analyzeFrame() {
+    anvCtx.drawImage(camEl, 0, 0, 80, 60);
+    const px = anvCtx.getImageData(0, 0, 80, 60).data;
+    const n = px.length / 4;
+    let lum = 0, white = 0, rSum = 0, bSum = 0;
+    for (let i = 0; i < px.length; i += 4) {
+      const r = px[i], g = px[i+1], b = px[i+2];
+      lum += 0.2126*r + 0.7152*g + 0.0722*b;
+      if (r > 200 && g > 200 && b > 200) white++;
+      rSum += r; bSum += b;
+    }
+    S.brightness = lerp(S.brightness, lum / (n * 255),      0.07);
+    S.whiteRatio = lerp(S.whiteRatio, white / n,             0.07);
+    S.colorTemp  = lerp(S.colorTemp,  rSum / (rSum+bSum+1), 0.05);
+  }
+
+  // ============================================================
+  //  マイク
+  // ============================================================
+  let micAnalyser = null, micBuf = null;
+
+  async function initMic() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      const ac = new (window.AudioContext || window.webkitAudioContext)();
+      micAnalyser = ac.createAnalyser();
+      micAnalyser.fftSize = 256;
+      ac.createMediaStreamSource(stream).connect(micAnalyser);
+      micBuf = new Uint8Array(micAnalyser.frequencyBinCount);
+    } catch (e) { console.warn('mic:', e); }
+  }
+
+  function analyzeMic() {
+    if (!micAnalyser) return;
+    micAnalyser.getByteFrequencyData(micBuf);
+    const rms = micBuf.reduce((s, v) => s + v, 0) / (micBuf.length * 255);
+    S.mic = lerp(S.mic, rms * 4, 0.1);
+  }
+
+  // ============================================================
+  //  加速度センサー
+  // ============================================================
+  const peakCallbacks = [];
+  function onPeak(fn) { peakCallbacks.push(fn); }
+
+  async function initMotion() {
+    // iOS 13+ ではユーザー操作からの requestPermission が必須
+    if (typeof DeviceMotionEvent !== 'undefined' &&
+        typeof DeviceMotionEvent.requestPermission === 'function') {
+      try { await DeviceMotionEvent.requestPermission(); } catch (_) {}
+    }
+
+    let prevMag = 0, lastPeak = 0;
+    window.addEventListener('devicemotion', (e) => {
+      const g = e.accelerationIncludingGravity;
+      if (!g) return;
+      const x = g.x||0, y = g.y||0, z = g.z||0;
+      const mag   = Math.sqrt(x*x + y*y + z*z);
+      const rel   = Math.max(mag - 9.8, 0);
+      S.accX  = x / 10;
+      S.accY  = y / 10;
+      S.accMag = lerp(S.accMag, Math.min(rel / 8, 1), 0.15);
+
+      const now = performance.now();
+      if (rel > 2.0 && prevMag <= rel && now - lastPeak > 250) {
+        lastPeak = now;
+        peakCallbacks.forEach((fn) => fn(rel));
+      }
+      prevMag = rel;
+    });
+  }
+
+  // ============================================================
+  //  音響エンジン ── お囃子 ＋ 大自然の複雑性
+  // ============================================================
+  //
+  //  Layer 1 : 太鼓 (MembraneSynth)   担ぎリズムに連動
+  //  Layer 2 : 鉦 / 鈴 (MetalSynth)   4打ちに1回＋散発
+  //  Layer 3 : 笛 (サイン＋ブレスノイズ)  明るさ・色温で漂う
+  //  Layer 4 : 環境テクスチャ (ピンクノイズ)
+  //  Layer 5 : ドローン (三角波)        担ぎ手ごとに異なる基音
+  //
+  //  音階: 四七抜き短音階 D E G A C
+  // ============================================================
+
+  const YO = ['D2','E2','G2','A2','C3',
+              'D3','E3','G3','A3','C4',
+              'D4','E4','G4','A4','C5',
+              'D5','E5','G5'];
+  // 担ぎ手番号ごとの音程オフセット（自然な不協和）
+  const OFFSETS = [0, 2, 4, 7, 9, 12, 14, 16];
+
+  let audio = {};
+
+  async function initAudio() {
+    await Tone.start();
+
+    // ── エフェクトチェーン ──────────────────────────
+    const master = new Tone.Gain(0.9).toDestination();
+    const reverb = new Tone.Reverb({ decay: 5, wet: 0.45 }).connect(master);
+    await reverb.ready;
+    // delay は絶対秒で指定（BPM非依存）
+    const delay  = new Tone.FeedbackDelay({ delayTime: 0.18, feedback: 0.20, wet: 0.12 })
+                     .connect(reverb);
+    const comp   = new Tone.Compressor(-16, 4).connect(delay);
+
+    // ── Layer 1: 太鼓 ──────────────────────────────
+    const taiko = new Tone.MembraneSynth({
+      pitchDecay: 0.10, octaves: 5,
+      oscillator: { type: 'sine' },
+      envelope: { attack: 0.001, decay: 0.8, sustain: 0, release: 0.4 },
+      volume: 0,    // しっかり聴こえる音量
+    }).connect(comp);
+
+    const kotsuzumi = new Tone.MembraneSynth({
+      pitchDecay: 0.05, octaves: 3,
+      oscillator: { type: 'triangle' },
+      envelope: { attack: 0.001, decay: 0.35, sustain: 0, release: 0.15 },
+      volume: -8,
+    }).connect(comp);
+
+    // ── Layer 2: 鉦・鈴 ───────────────────────────
+    const kane = new Tone.MetalSynth({
+      frequency: 400, harmonicity: 5.1, modulationIndex: 32,
+      resonance: 3200, octaves: 1.5,
+      envelope: { attack: 0.001, decay: 1.0, release: 0.2 },
+      volume: -6,
+    }).connect(reverb);
+
+    const suzu = new Tone.MetalSynth({
+      frequency: 1200, harmonicity: 3.1, modulationIndex: 16,
+      resonance: 5000, octaves: 0.8,
+      envelope: { attack: 0.001, decay: 0.22, release: 0.05 },
+      volume: -14,
+    }).connect(reverb);
+
+    // ── Layer 3: 笛 ───────────────────────────────
+    const fueOsc = new Tone.OmniOscillator({ type: 'sine', frequency: 'G4', volume: -10 })
+      .connect(comp);
+    const fueVib = new Tone.LFO({ frequency: 5.2, min: -5, max: 5 });
+    fueVib.connect(fueOsc.frequency);
+    fueVib.start();
+
+    const breathFilt = new Tone.Filter({ type: 'bandpass', frequency: 1800, Q: 3 }).connect(comp);
+    const breathNoise = new Tone.Noise('white');
+    breathNoise.volume.value = -26;
+    breathNoise.connect(breathFilt);
+    breathNoise.start();
+    fueOsc.start();
+
+    // ── Layer 4: 環境テクスチャ ──────────────────
+    const envFilt1 = new Tone.Filter({ type: 'bandpass', frequency: 500,  Q: 0.8 }).connect(reverb);
+    const envFilt2 = new Tone.Filter({ type: 'bandpass', frequency: 2200, Q: 1.5 }).connect(reverb);
+    const envNoise = new Tone.Noise('pink');
+    envNoise.volume.value = -22;    // 環境音として明確に聴こえる
+    envNoise.connect(envFilt1);
+    envNoise.connect(envFilt2);
+    envNoise.start();
+
+    // ── Layer 5: ドローン ─────────────────────────
+    const baseNote = YO[OFFSETS[voiceIndex % OFFSETS.length]];
+    const droneFreq = Tone.Frequency(baseNote).toFrequency();
+    const drone = new Tone.OmniOscillator({ type: 'triangle', frequency: droneFreq, volume: -16 })
+      .connect(reverb);
+    drone.start();
+
+    // ── 動作確認用：起動直後に1打 ─────────────────
+    // （audio chainが繋がっているか確認）
+    setTimeout(() => {
+      const startNote = YO[OFFSETS[voiceIndex % OFFSETS.length] + 2] || 'G3';
+      taiko.triggerAttackRelease(startNote, '8n', Tone.now(), 0.5);
+      setTimeout(() => kane.triggerAttackRelease(Tone.now(), 0.6), 300);
+    }, 300);
+
+    // ── リズムエンジン（ピーク検出→打撃） ────────
+    let kaneCount = 0;
+    onPeak((rel) => {
+      const vel     = Math.min(rel / 5, 1);
+      const noteIdx = OFFSETS[voiceIndex % OFFSETS.length] + Math.floor(S.brightness * 3);
+      const note    = YO[Math.min(noteIdx, YO.length - 1)];
+
+      taiko.triggerAttackRelease(note, '8n', Tone.now(), 0.45 + vel * 0.5);
+
+      const offNote = YO[Math.min(noteIdx + 4, YO.length - 1)];
+      kotsuzumi.triggerAttackRelease(offNote, '16n', Tone.now() + 0.07, 0.25 + vel * 0.3);
+
+      kaneCount++;
+      if (kaneCount % 4 === 0) {
+        kane.frequency.value = 200 + S.colorTemp * 600;
+        kane.triggerAttackRelease(Tone.now() + 0.03, 0.55);
+      }
+      if (Math.random() < 0.4) {
+        suzu.frequency.value = 800 + Math.random() * 800;
+        suzu.triggerAttackRelease(Tone.now() + 0.05 * Math.random(), 0.3 + Math.random() * 0.4);
+      }
+    });
+
+    // ── 笛フレーズ自動進行 ─────────────────────
+    let fueIdx = 4 + OFFSETS[voiceIndex % OFFSETS.length];
+    function advanceFue() {
+      const moveProb = 0.3 + S.accMag * 0.65;
+      if (Math.random() < moveProb) {
+        fueIdx += (Math.random() < 0.6 ? 1 : -1) * (Math.random() < 0.7 ? 1 : 2);
+        fueIdx = Math.max(2, Math.min(YO.length - 1, fueIdx));
+      }
+      const tempOff = Math.round((1 - S.colorTemp) * 3);
+      const idx     = Math.max(0, Math.min(YO.length - 1, fueIdx + tempOff));
+      fueOsc.frequency.rampTo(Tone.Frequency(YO[idx]).toFrequency(), 0.35 + Math.random() * 0.5);
+      breathFilt.frequency.rampTo(Tone.Frequency(YO[idx]).toFrequency() * 2.2, 0.2);
+      const nextIn = (0.7 + Math.random() * 1.6) / (0.5 + S.accMag * 1.5) * 1000;
+      setTimeout(advanceFue, nextIn);
+    }
+    advanceFue();
+
+    audio = {
+      taiko, kotsuzumi, kane, suzu,
+      fueOsc, breathFilt, breathNoise,
+      envNoise, envFilt1, envFilt2,
+      drone, reverb, delay, comp, master,
+    };
+
+    // ── 継続パラメータ更新ループ ──────────────────
+    updateLoop();
+  }
+
+  function updateLoop() {
+    requestAnimationFrame(updateLoop);
+    if (!audio.reverb) return;
+
+    // カメラ・マイク解析
+    analyzeFrame();
+    analyzeMic();
+
+    // 環境ノイズ：マイク→音量、明るさ→帯域
+    audio.envFilt1.frequency.rampTo(150 + S.mic * 700,        0.3);
+    audio.envFilt2.frequency.rampTo(1000 + S.brightness*3500, 0.4);
+    audio.envNoise.volume.rampTo(-28 + S.mic * 10, 0.3);
+
+    // ブレスノイズ：動きで息が荒くなる
+    audio.breathNoise.volume.rampTo(-30 + S.accMag * 14, 0.2);
+
+    // ドローン：色温度で微小ピッチシフト
+    audio.drone.detune.rampTo((S.colorTemp - 0.5) * 25, 1.5);
+
+    // リバーブ：観客増加で空間が広がる
+    audio.reverb.wet.rampTo(0.3 + Math.min(audienceCount / 20, 1) * 0.5, 2);
+  }
+
+  function applyWorldToAudio(s) {
+    if (!audio.reverb) return;
+    audio.reverb.wet.rampTo(0.3 + Math.min(s.audienceCount / 20, 1) * 0.5, 2);
+  }
+
+  // ============================================================
+  //  ビデオフレームキャプチャ（送信用 canvas 320x240）
+  // ============================================================
+  const capCanvas = document.getElementById('capture-canvas');
+  const capCtx    = capCanvas.getContext('2d');  // willReadFrequently 不要
+
+  function startVideoCapture() {
+    setInterval(() => {
+      if (!audioReady || camEl.readyState < 2) return;
+      capCtx.drawImage(camEl, 0, 0, 320, 240);
+      socket.emit('video_frame', capCanvas.toDataURL('image/jpeg', 0.4));
+    }, 500);
+  }
+
+  // ============================================================
+  //  ユーティリティ
+  // ============================================================
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  </script>
+</body>
+</html>

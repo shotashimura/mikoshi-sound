@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>神輿サウンド</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0a0010;
+      color: #e8d5a0;
+      font-family: 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    canvas#bg { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+    .container {
+      position: relative; z-index: 1;
+      text-align: center;
+      padding: 2rem;
+      max-width: 600px;
+      width: 100%;
+    }
+    h1 {
+      font-size: 2.4rem;
+      letter-spacing: 0.4em;
+      margin-bottom: 0.4rem;
+      background: linear-gradient(135deg, #e8d5a0, #ff9a3c, #e8d5a0);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .sub {
+      font-size: 0.85rem;
+      letter-spacing: 0.2em;
+      color: #a07840;
+      margin-bottom: 3rem;
+    }
+    .cards {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.2rem;
+      margin-bottom: 3rem;
+    }
+    .card {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,200,100,0.2);
+      border-radius: 16px;
+      padding: 1.8rem 1rem;
+      text-decoration: none;
+      color: inherit;
+      transition: all 0.3s;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.8rem;
+    }
+    .card:hover {
+      background: rgba(255,200,100,0.08);
+      border-color: rgba(255,200,100,0.5);
+      transform: translateY(-3px);
+    }
+    .card .icon { font-size: 2.4rem; }
+    .card .label {
+      font-size: 0.75rem;
+      letter-spacing: 0.25em;
+      color: #a07840;
+    }
+    .card .title { font-size: 1.1rem; letter-spacing: 0.1em; }
+    .qr-section {
+      margin-top: 1rem;
+    }
+    .qr-label {
+      font-size: 0.8rem;
+      letter-spacing: 0.2em;
+      color: #a07840;
+      margin-bottom: 1rem;
+    }
+    #qr-img {
+      width: 180px;
+      height: 180px;
+      border-radius: 12px;
+      background: #fff;
+      padding: 8px;
+    }
+    .qr-url {
+      font-size: 0.75rem;
+      color: #604820;
+      margin-top: 0.6rem;
+      word-break: break-all;
+    }
+    .status {
+      margin-top: 2.5rem;
+      font-size: 0.8rem;
+      color: #604820;
+      letter-spacing: 0.15em;
+    }
+    .dot {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #ff6a00;
+      margin-right: 6px;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%,100% { opacity:1; } 50% { opacity:0.3; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="bg"></canvas>
+  <div class="container">
+    <h1>神輿サウンド</h1>
+    <p class="sub">MIKOSHI SOUND SYSTEM</p>
+    <div class="cards">
+      <a href="/mikoshi" class="card">
+        <span class="icon">🏮</span>
+        <span class="label">CARRIER</span>
+        <span class="title">担ぎ手</span>
+      </a>
+      <a href="/audience" class="card">
+        <span class="icon">👥</span>
+        <span class="label">AUDIENCE</span>
+        <span class="title">観客</span>
+      </a>
+    </div>
+    <div class="qr-section">
+      <p class="qr-label">— 観客はこのQRコードから参加 —</p>
+      <img id="qr-img" alt="QR Code"/>
+      <p class="qr-url" id="qr-url"></p>
+    </div>
+    <div class="status">
+      <span class="dot"></span>
+      <span id="status-text">接続待機中…</span>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    // QRコード取得
+    fetch('/api/qr')
+      .then(r => r.json())
+      .then(data => {
+        document.getElementById('qr-img').src = data.audienceQR;
+        document.getElementById('qr-url').textContent = data.audienceUrl;
+      })
+      .catch(() => {
+        document.getElementById('qr-url').textContent = window.location.origin + '/audience';
+      });
+
+    // Socket接続状態表示
+    const socket = io();
+    socket.on('world_state', (s) => {
+      document.getElementById('status-text').textContent =
+        `担ぎ手: ${s.mikoshiCount}台 | 観客: ${s.audienceCount}台`;
+    });
+
+    // 背景パーティクル
+    const canvas = document.getElementById('bg');
+    const ctx = canvas.getContext('2d');
+    let w, h;
+    const particles = [];
+
+    function resize() {
+      w = canvas.width = window.innerWidth;
+      h = canvas.height = window.innerHeight;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    for (let i = 0; i < 80; i++) {
+      particles.push({
+        x: Math.random() * 1, y: Math.random() * 1,
+        vx: (Math.random()-0.5)*0.0002,
+        vy: -(Math.random()*0.0003 + 0.0001),
+        size: Math.random() * 2.5 + 0.5,
+        alpha: Math.random() * 0.6 + 0.1,
+        hue: Math.random() * 30 + 30,
+      });
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, w, h);
+      for (const p of particles) {
+        p.x += p.vx; p.y += p.vy;
+        if (p.y < -0.02) { p.y = 1.02; p.x = Math.random(); }
+        ctx.beginPath();
+        ctx.arc(p.x * w, p.y * h, p.size, 0, Math.PI*2);
+        ctx.fillStyle = `hsla(${p.hue}, 80%, 70%, ${p.alpha})`;
+        ctx.fill();
+      }
+      requestAnimationFrame(draw);
+    }
+    draw();
+  </script>
+</body>
+</html>

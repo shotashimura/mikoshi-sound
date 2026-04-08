@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <title>神輿サウンド – 観客</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+
+    /* ベース：担ぎ手カメラ映像コンテナ（絶対配置で確実に表示） */
+    #feeds {
+      position: fixed;
+      inset: 0;
+    }
+
+    /* 各映像セル：JSで位置・サイズを動的設定 */
+    .feed-cell {
+      position: absolute;
+      overflow: hidden;
+    }
+    .feed-cell img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      filter: brightness(0.82) saturate(1.15);
+      opacity: 0;
+      transition: opacity 0.5s ease;
+    }
+    .feed-cell img.visible {
+      opacity: 1;
+    }
+
+    /* 担ぎ手ゼロ時: 暗い背景 */
+    #no-feed {
+      position: fixed; inset: 0;
+      background: #080810;
+      display: flex; align-items: center; justify-content: center;
+      color: rgba(200,210,255,0.25);
+      font-size: 0.75rem; letter-spacing: 0.3em;
+      font-family: sans-serif;
+      transition: opacity 0.8s;
+    }
+    #no-feed.hidden { opacity: 0; pointer-events: none; }
+
+    /* エフェクト canvas（映像の上に重ねる） */
+    #fx {
+      position: fixed; inset: 0;
+      pointer-events: none;
+      mix-blend-mode: screen;
+      z-index: 10;
+    }
+
+    /* タップ開始 */
+    #start-screen {
+      position: fixed; inset: 0; z-index: 100;
+      background: #000;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 1.5rem;
+      cursor: pointer; -webkit-tap-highlight-color: transparent;
+    }
+    #start-screen .kanji {
+      font-size: 5rem; color: rgba(130,200,255,0.85); font-family: serif;
+    }
+    #start-screen .hint {
+      font-size: 0.8rem; color: rgba(130,200,255,0.3);
+      font-family: sans-serif; letter-spacing: 0.35em;
+      animation: blink 2.5s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.1} }
+  </style>
+</head>
+<body>
+  <div id="feeds"></div>
+  <div id="no-feed">神輿の接続を待っています…</div>
+  <canvas id="fx"></canvas>
+
+  <div id="start-screen">
+    <div class="kanji">観客</div>
+    <div class="hint">タップして参加</div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+  'use strict';
+
+  // ============================================================
+  //  状態
+  // ============================================================
+  let world = {
+    mikoshiCount: 0, audienceCount: 0,
+    avgBrightness: 0.5, avgWhiteRatio: 0.3, avgColorTemp: 0.5,
+    totalMovement: 0, maxMic: 0, devices: [],
+  };
+
+  // 映像セル管理（deviceId → { cell, img, lastUpdate }）
+  const feedCells = new Map();
+  let audioReady = false;
+
+  // ============================================================
+  //  Socket.io
+  // ============================================================
+  const socket = io();
+
+  socket.on('world_state', (s) => {
+    world = s;
+    updateNoFeed(s.mikoshiCount);
+    if (audioReady) applyWorldToAudio(s);
+  });
+
+  // 担ぎ手のフレームを受信
+  socket.on('video_frame', ({ deviceId, voiceIndex, data }) => {
+    ensureFeedCell(deviceId, voiceIndex);
+    const c = feedCells.get(deviceId);
+    if (!c) return;
+    c.img.src = data;
+    c.img.classList.add('visible');
+    c.lastUpdate = Date.now();
+  });
+
+  // 担ぎ手切断
+  socket.on('mikoshi_disconnected', ({ deviceId }) => {
+    removeFeedCell(deviceId);
+  });
+
+  // ============================================================
+  //  タップで開始
+  // ============================================================
+  document.getElementById('start-screen').addEventListener('pointerdown', async () => {
+    document.getElementById('start-screen').remove();
+    socket.emit('join_audience');
+    await initAudio();
+    startFx();
+    audioReady = true;
+  }, { once: true });
+
+  // ============================================================
+  //  映像セル管理（絶対配置・JSでレイアウト）
+  // ============================================================
+  const feedsEl = document.getElementById('feeds');
+
+  function ensureFeedCell(deviceId, voiceIndex) {
+    if (feedCells.has(deviceId)) return;
+    const cell = document.createElement('div');
+    cell.className = 'feed-cell';
+    const img = document.createElement('img');
+    img.alt = '';
+    cell.appendChild(img);
+    feedsEl.appendChild(cell);
+    feedCells.set(deviceId, { cell, img, lastUpdate: Date.now() });
+    layoutFeeds();
+  }
+
+  function removeFeedCell(deviceId) {
+    const c = feedCells.get(deviceId);
+    if (!c) return;
+    c.img.classList.remove('visible');
+    setTimeout(() => {
+      try { c.cell.remove(); } catch (_) {}
+      feedCells.delete(deviceId);
+      layoutFeeds();
+    }, 600);
+  }
+
+  // セルの位置・サイズを明示的に計算して設定
+  function layoutFeeds() {
+    const n = feedCells.size;
+    const cells = Array.from(feedCells.values());
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+
+    cells.forEach((c, i) => {
+      const s = c.cell.style;
+      if (n === 1) {
+        // 1台：フルスクリーン
+        s.left   = '0px';
+        s.top    = '0px';
+        s.width  = W + 'px';
+        s.height = H + 'px';
+      } else if (n === 2) {
+        // 2台：左右分割
+        s.left   = (i * W / 2) + 'px';
+        s.top    = '0px';
+        s.width  = (W / 2) + 'px';
+        s.height = H + 'px';
+      } else {
+        // 3台以上：2x2グリッド（最大4）
+        const col = i % 2;
+        const row = Math.floor(i / 2);
+        s.left   = (col * W / 2) + 'px';
+        s.top    = (row * H / 2) + 'px';
+        s.width  = (W / 2) + 'px';
+        s.height = (H / 2) + 'px';
+      }
+    });
+
+    updateNoFeed(n);
+  }
+
+  window.addEventListener('resize', layoutFeeds);
+
+  function updateNoFeed(mikoshiCount) {
+    document.getElementById('no-feed').classList.toggle('hidden', mikoshiCount > 0);
+  }
+
+  // タイムアウトしたセルを除去（5秒フレームなし）
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, c] of feedCells) {
+      if (now - c.lastUpdate > 5000) removeFeedCell(id);
+    }
+  }, 3000);
+
+  // ============================================================
+  //  音響エンジン（観客）
+  //  担ぎ手音に「共鳴・呼応」する補完音
+  //
+  //  Layer 1: パッドコード (AMSynth)   担ぎ手の倍音域で鳴る
+  //  Layer 2: 散発的な鈴 (MetalSynth)  神輿の動きで密度変化
+  //  Layer 3: 遠景環境テクスチャ
+  // ============================================================
+
+  const YO = ['D2','E2','G2','A2','C3',
+              'D3','E3','G3','A3','C4',
+              'D4','E4','G4','A4','C5'];
+
+  let audio = {};
+
+  async function initAudio() {
+    await Tone.start();
+
+    const master = new Tone.Gain(0.75).toDestination();
+    const reverb = new Tone.Reverb({ decay: 7, wet: 0.6 }).connect(master);
+    await reverb.ready;
+    const lopass = new Tone.Filter({ type: 'lowpass', frequency: 1800, rolloff: -24 })
+                     .connect(reverb);
+
+    // パッド和音（attack を短くして即座に聴こえる）
+    const pad = new Tone.PolySynth(Tone.AMSynth, {
+      harmonicity: 2.0,
+      oscillator: { type: 'sine' },
+      envelope: { attack: 0.8, decay: 2, sustain: 0.75, release: 8 },
+      modulation: { type: 'triangle' },
+      modulationEnvelope: { attack: 2, decay: 1, sustain: 0.5, release: 6 },
+      volume: -14,
+    }).connect(lopass);
+
+    // 観客IDから和音を選択（各デバイスが違う和音）
+    const aidx = parseInt(socket.id.slice(-4), 16) % 3;
+    const chords = [
+      ['G3','D4','A4'],
+      ['A3','E4','C5'],
+      ['D3','A3','G4'],
+    ];
+    pad.triggerAttack(chords[aidx]);
+
+    // 鈴（散発的）
+    const suzuAud = new Tone.MetalSynth({
+      frequency: 900, harmonicity: 4.1, modulationIndex: 20,
+      resonance: 4000, octaves: 1.0,
+      envelope: { attack: 0.001, decay: 0.7, release: 0.1 },
+      volume: -18,
+    }).connect(reverb);
+
+    // 遠景テクスチャ
+    const envFilt = new Tone.Filter({ type: 'bandpass', frequency: 700, Q: 1.2 }).connect(reverb);
+    const envNoise = new Tone.Noise('pink');
+    envNoise.volume.value = -32;
+    envNoise.connect(envFilt);
+    envNoise.start();
+
+    // LFO
+    const lfoFilt = new Tone.LFO({ frequency: 0.04, min: 500, max: 2000 });
+    lfoFilt.connect(lopass.frequency);
+    lfoFilt.start();
+
+    audio = { pad, suzuAud, envNoise, envFilt, lopass, reverb, lfoFilt, master };
+
+    // 鈴：散発自動再生
+    function ringRandom() {
+      const gap = world.mikoshiCount > 0
+        ? (500 + Math.random() * 2000) / (0.4 + world.totalMovement * 0.25)
+        : 3500 + Math.random() * 2000;
+      setTimeout(() => {
+        if (world.mikoshiCount > 0) {
+          suzuAud.frequency.value = 600 + Math.random() * 1000;
+          suzuAud.triggerAttackRelease(Tone.now(), 0.25 + Math.random() * 0.5);
+        }
+        ringRandom();
+      }, gap);
+    }
+    ringRandom();
+  }
+
+  function applyWorldToAudio(s) {
+    if (!audio.lopass) return;
+    const crowd = Math.min(s.mikoshiCount + s.audienceCount, 40) / 40;
+    const move  = Math.min(s.totalMovement / 4, 1);
+
+    // 人が増えるとフィルターが開く
+    audio.lopass.frequency.rampTo(600 + crowd * 3000, 1.5);
+    // 動きでリバーブ
+    audio.reverb.wet.rampTo(0.45 + move * 0.4, 1.5);
+    // LFO速度
+    audio.lfoFilt.frequency.rampTo(0.03 + move * 0.18, 2);
+    // テクスチャ音量
+    audio.envNoise.volume.rampTo(-36 + move * 12 + (s.maxMic * 6), 0.5);
+
+    if (s.mikoshiCount === 0) {
+      audio.pad.releaseAll(Tone.now() + 3);
+    }
+  }
+
+  // ============================================================
+  //  エフェクト canvas（波紋）
+  // ============================================================
+  function startFx() {
+    const canvas = document.getElementById('fx');
+    const ctx = canvas.getContext('2d');
+    let W, H;
+    const resize = () => {
+      W = canvas.width  = window.innerWidth;
+      H = canvas.height = window.innerHeight;
+    };
+    resize();
+    window.addEventListener('resize', resize);
+
+    const ripples = [];
+    let lastRipple = 0;
+
+    function addRipple(x, y, hue, maxR) {
+      ripples.push({ x, y, r: 5, maxR, alpha: 0.4, hue });
+    }
+
+    function loop() {
+      requestAnimationFrame(loop);
+      // 残像（薄く消えていく）
+      ctx.fillStyle = 'rgba(0,0,0,0.06)';
+      ctx.fillRect(0, 0, W, H);
+
+      const { devices, totalMovement, avgBrightness, avgColorTemp } = world;
+      const now  = performance.now();
+      const gap  = Math.max(120, 750 - totalMovement * 60);
+
+      if (devices.length > 0 && now - lastRipple > gap) {
+        lastRipple = now;
+        devices.forEach((d, i) => {
+          const angle = (i / Math.max(devices.length, 1)) * Math.PI * 2;
+          const cx = W * 0.5 + Math.cos(angle) * W * 0.2;
+          const cy = H * 0.5 + Math.sin(angle) * H * 0.18;
+          const hue = avgColorTemp * 50 + 10;
+          const maxR = 90 + (d.accMagnitude||0.2)*260 + (d.micLevel||0)*100;
+          addRipple(cx, cy, hue, maxR);
+        });
+      }
+      // 担ぎ手ゼロ時は中央から静かに
+      if (devices.length === 0 && now - lastRipple > 3000) {
+        lastRipple = now;
+        addRipple(W * 0.5, H * 0.5, 210, 70);
+      }
+
+      // 描画
+      const speed = 1.3 + totalMovement * 0.75;
+      for (let i = ripples.length - 1; i >= 0; i--) {
+        const rp = ripples[i];
+        rp.r     += speed;
+        rp.alpha -= 0.004;
+        if (rp.alpha <= 0 || rp.r > rp.maxR) { ripples.splice(i, 1); continue; }
+        const prog = 1 - rp.r / rp.maxR;
+        ctx.beginPath();
+        ctx.arc(rp.x, rp.y, rp.r, 0, Math.PI * 2);
+        ctx.strokeStyle = `hsla(${rp.hue}, 85%, 65%, ${rp.alpha * prog})`;
+        ctx.lineWidth   = 1.5 * prog * 2.5;
+        ctx.stroke();
+      }
+
+      // 散乱光点
+      if (Math.random() < 0.06 * (0.5 + avgBrightness)) {
+        ctx.beginPath();
+        ctx.arc(Math.random()*W, Math.random()*H, Math.random()*1.5, 0, Math.PI*2);
+        ctx.fillStyle = `hsla(${avgColorTemp*40+20}, 70%, 88%, ${Math.random()*0.3})`;
+        ctx.fill();
+      }
+    }
+    loop();
+  }
+  </script>
+</body>
+</html>
