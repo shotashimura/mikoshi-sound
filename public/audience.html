@@ -8,34 +8,28 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
 
-    /* ベース：担ぎ手カメラ映像コンテナ（絶対配置で確実に表示） */
-    #feeds {
-      position: fixed;
-      inset: 0;
-    }
+    /* 担ぎ手カメラ映像のコンテナ */
+    #feeds { position: fixed; inset: 0; }
 
-    /* 各映像セル：JSで位置・サイズを動的設定 */
+    /* 各映像セル（JSで位置・サイズを明示指定） */
     .feed-cell {
       position: absolute;
       overflow: hidden;
+      background: #000;
     }
-    .feed-cell img {
+    .feed-cell video {
       position: absolute;
       inset: 0;
-      width: 100%;
-      height: 100%;
+      width: 100%; height: 100%;
       object-fit: cover;
-      filter: brightness(0.82) saturate(1.15);
       opacity: 0;
-      transition: opacity 0.5s ease;
+      transition: opacity 0.6s ease;
     }
-    .feed-cell img.visible {
-      opacity: 1;
-    }
+    .feed-cell video.visible { opacity: 1; }
 
-    /* 担ぎ手ゼロ時: 暗い背景 */
+    /* 担ぎ手ゼロ時 */
     #no-feed {
-      position: fixed; inset: 0;
+      position: fixed; inset: 0; z-index: 5;
       background: #080810;
       display: flex; align-items: center; justify-content: center;
       color: rgba(200,210,255,0.25);
@@ -45,7 +39,7 @@
     }
     #no-feed.hidden { opacity: 0; pointer-events: none; }
 
-    /* エフェクト canvas（映像の上に重ねる） */
+    /* エフェクト canvas */
     #fx {
       position: fixed; inset: 0;
       pointer-events: none;
@@ -53,23 +47,25 @@
       z-index: 10;
     }
 
-    /* タップ開始 */
-    #start-screen {
-      position: fixed; inset: 0; z-index: 100;
-      background: #000;
-      display: flex; flex-direction: column;
-      align-items: center; justify-content: center; gap: 1.5rem;
-      cursor: pointer; -webkit-tap-highlight-color: transparent;
+    /* 音声開始用のタップオーバーレイ（半透明・小さい） */
+    #audio-tap {
+      position: fixed;
+      bottom: 2rem; left: 50%; transform: translateX(-50%);
+      z-index: 20;
+      padding: 0.6rem 1.4rem;
+      background: rgba(255,220,100,0.12);
+      border: 1px solid rgba(255,220,100,0.25);
+      border-radius: 999px;
+      color: rgba(255,220,100,0.5);
+      font-size: 0.7rem; letter-spacing: 0.25em;
+      font-family: sans-serif;
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      animation: blink 3s ease-in-out infinite;
     }
-    #start-screen .kanji {
-      font-size: 5rem; color: rgba(130,200,255,0.85); font-family: serif;
-    }
-    #start-screen .hint {
-      font-size: 0.8rem; color: rgba(130,200,255,0.3);
-      font-family: sans-serif; letter-spacing: 0.35em;
-      animation: blink 2.5s ease-in-out infinite;
-    }
-    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.1} }
+    #audio-tap.hidden { display: none; }
+
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.25} }
   </style>
 </head>
 <body>
@@ -77,10 +73,8 @@
   <div id="no-feed">神輿の接続を待っています…</div>
   <canvas id="fx"></canvas>
 
-  <div id="start-screen">
-    <div class="kanji">観客</div>
-    <div class="hint">タップして参加</div>
-  </div>
+  <!-- 音声は別途タップが必要（iOS制約） -->
+  <div id="audio-tap">タップして音声を有効化</div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
   <script src="/socket.io/socket.io.js"></script>
@@ -96,14 +90,19 @@
     totalMovement: 0, maxMic: 0, devices: [],
   };
 
-  // 映像セル管理（deviceId → { cell, img, lastUpdate }）
-  const feedCells = new Map();
+  // 担ぎ手ごとの映像セル管理
+  const feedCells = new Map(); // broadcasterId → { cell, video, pc }
   let audioReady = false;
 
   // ============================================================
-  //  Socket.io
+  //  Socket.io（ページロード直後に join）
   // ============================================================
-  const socket = io();
+  const socket = io({ transports: ['websocket'] });
+
+  // ページを開いたらすぐルームに入る（映像表示にタップ不要）
+  socket.on('connect', () => {
+    socket.emit('join_audience');
+  });
 
   socket.on('world_state', (s) => {
     world = s;
@@ -111,93 +110,129 @@
     if (audioReady) applyWorldToAudio(s);
   });
 
-  // 担ぎ手のフレームを受信
-  socket.on('video_frame', ({ deviceId, voiceIndex, data }) => {
-    ensureFeedCell(deviceId, voiceIndex);
-    const c = feedCells.get(deviceId);
-    if (!c) return;
-    c.img.src = data;
-    c.img.classList.add('visible');
-    c.lastUpdate = Date.now();
+  // 担ぎ手が接続 or 既に接続中 → WebRTC接続を開始
+  socket.on('broadcaster_arrived', ({ broadcasterId, voiceIndex }) => {
+    console.log('[broadcaster_arrived]', broadcasterId);
+    startViewing(broadcasterId, voiceIndex);
   });
 
-  // 担ぎ手切断
-  socket.on('mikoshi_disconnected', ({ deviceId }) => {
-    removeFeedCell(deviceId);
+  // 担ぎ手が切断
+  socket.on('broadcaster_left', ({ broadcasterId }) => {
+    removeFeedCell(broadcasterId);
   });
 
   // ============================================================
-  //  タップで開始
+  //  WebRTC: viewer（担ぎ手からの映像を受信）
   // ============================================================
-  document.getElementById('start-screen').addEventListener('pointerdown', async () => {
-    document.getElementById('start-screen').remove();
-    socket.emit('join_audience');
-    await initAudio();
-    startFx();
-    audioReady = true;
-  }, { once: true });
+  const ICE_CONFIG = {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+    ],
+  };
+
+  async function startViewing(broadcasterId, voiceIndex) {
+    // 既存のPCがあれば閉じる
+    const existing = feedCells.get(broadcasterId);
+    if (existing?.pc) existing.pc.close();
+
+    const pc = new RTCPeerConnection(ICE_CONFIG);
+
+    // 映像セルを準備
+    ensureFeedCell(broadcasterId, voiceIndex, pc);
+
+    // 映像トラックの受信
+    pc.ontrack = (e) => {
+      const cell = feedCells.get(broadcasterId);
+      if (!cell) return;
+      if (e.streams[0]) {
+        cell.video.srcObject = e.streams[0];
+        cell.video.autoplay = true;
+        cell.video.muted    = true;
+        cell.video.playsInline = true;
+        cell.video.play().then(() => {
+          cell.video.classList.add('visible');
+          updateNoFeed(feedCells.size);
+        }).catch(console.warn);
+      }
+    };
+
+    // ICE candidate
+    pc.onicecandidate = (e) => {
+      if (e.candidate) socket.emit('ice', { to: broadcasterId, ice: e.candidate });
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log(`[PC ${broadcasterId.slice(-4)}] ${pc.connectionState}`);
+    };
+
+    // 担ぎ手に「見たい」とリクエスト → 担ぎ手が offer を作って返す
+    socket.emit('viewer_request', { broadcasterId });
+
+    // Offer を受信して answer を返す
+    socket.once('offer', async ({ from, offer }) => {
+      if (from !== broadcasterId) return;
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit('answer', { to: broadcasterId, answer });
+    });
+
+    // ICE（担ぎ手→観客）
+    socket.on('ice', ({ from, ice }) => {
+      if (from !== broadcasterId) return;
+      pc.addIceCandidate(new RTCIceCandidate(ice)).catch(() => {});
+    });
+
+    const cell = feedCells.get(broadcasterId);
+    if (cell) cell.pc = pc;
+  }
 
   // ============================================================
-  //  映像セル管理（絶対配置・JSでレイアウト）
+  //  映像セル管理
   // ============================================================
   const feedsEl = document.getElementById('feeds');
 
-  function ensureFeedCell(deviceId, voiceIndex) {
-    if (feedCells.has(deviceId)) return;
+  function ensureFeedCell(broadcasterId, voiceIndex, pc) {
+    if (feedCells.has(broadcasterId)) return;
     const cell = document.createElement('div');
     cell.className = 'feed-cell';
-    const img = document.createElement('img');
-    img.alt = '';
-    cell.appendChild(img);
+    const video = document.createElement('video');
+    video.muted = true; video.playsInline = true;
+    cell.appendChild(video);
     feedsEl.appendChild(cell);
-    feedCells.set(deviceId, { cell, img, lastUpdate: Date.now() });
+    feedCells.set(broadcasterId, { cell, video, pc: pc || null });
     layoutFeeds();
   }
 
-  function removeFeedCell(deviceId) {
-    const c = feedCells.get(deviceId);
+  function removeFeedCell(broadcasterId) {
+    const c = feedCells.get(broadcasterId);
     if (!c) return;
-    c.img.classList.remove('visible');
+    if (c.pc) c.pc.close();
+    c.video.classList.remove('visible');
     setTimeout(() => {
       try { c.cell.remove(); } catch (_) {}
-      feedCells.delete(deviceId);
+      feedCells.delete(broadcasterId);
       layoutFeeds();
-    }, 600);
+      updateNoFeed(feedCells.size);
+    }, 700);
   }
 
-  // セルの位置・サイズを明示的に計算して設定
   function layoutFeeds() {
-    const n = feedCells.size;
     const cells = Array.from(feedCells.values());
-    const W = window.innerWidth;
-    const H = window.innerHeight;
-
+    const n = cells.length;
+    const W = window.innerWidth, H = window.innerHeight;
     cells.forEach((c, i) => {
       const s = c.cell.style;
       if (n === 1) {
-        // 1台：フルスクリーン
-        s.left   = '0px';
-        s.top    = '0px';
-        s.width  = W + 'px';
-        s.height = H + 'px';
+        s.left = '0'; s.top = '0'; s.width = W+'px'; s.height = H+'px';
       } else if (n === 2) {
-        // 2台：左右分割
-        s.left   = (i * W / 2) + 'px';
-        s.top    = '0px';
-        s.width  = (W / 2) + 'px';
-        s.height = H + 'px';
+        s.left = (i * W/2)+'px'; s.top = '0'; s.width = (W/2)+'px'; s.height = H+'px';
       } else {
-        // 3台以上：2x2グリッド（最大4）
-        const col = i % 2;
-        const row = Math.floor(i / 2);
-        s.left   = (col * W / 2) + 'px';
-        s.top    = (row * H / 2) + 'px';
-        s.width  = (W / 2) + 'px';
-        s.height = (H / 2) + 'px';
+        s.left = ((i%2) * W/2)+'px'; s.top = (Math.floor(i/2) * H/2)+'px';
+        s.width = (W/2)+'px'; s.height = (H/2)+'px';
       }
     });
-
-    updateNoFeed(n);
   }
 
   window.addEventListener('resize', layoutFeeds);
@@ -206,27 +241,26 @@
     document.getElementById('no-feed').classList.toggle('hidden', mikoshiCount > 0);
   }
 
-  // タイムアウトしたセルを除去（5秒フレームなし）
+  // タイムアウト監視（VideoElement が止まっているセルを除去）
   setInterval(() => {
-    const now = Date.now();
     for (const [id, c] of feedCells) {
-      if (now - c.lastUpdate > 5000) removeFeedCell(id);
+      if (c.pc && (c.pc.connectionState === 'failed' || c.pc.connectionState === 'disconnected')) {
+        removeFeedCell(id);
+      }
     }
-  }, 3000);
+  }, 5000);
 
   // ============================================================
-  //  音響エンジン（観客）
-  //  担ぎ手音に「共鳴・呼応」する補完音
-  //
-  //  Layer 1: パッドコード (AMSynth)   担ぎ手の倍音域で鳴る
-  //  Layer 2: 散発的な鈴 (MetalSynth)  神輿の動きで密度変化
-  //  Layer 3: 遠景環境テクスチャ
+  //  音声（音楽は別途タップ後に起動）
   // ============================================================
+  const audioTapEl = document.getElementById('audio-tap');
+  audioTapEl.addEventListener('pointerdown', async () => {
+    audioTapEl.classList.add('hidden');
+    await initAudio();
+    audioReady = true;
+  }, { once: true });
 
-  const YO = ['D2','E2','G2','A2','C3',
-              'D3','E3','G3','A3','C4',
-              'D4','E4','G4','A4','C5'];
-
+  const YO = ['D2','E2','G2','A2','C3','D3','E3','G3','A3','C4','D4','E4','G4','A4','C5'];
   let audio = {};
 
   async function initAudio() {
@@ -235,10 +269,8 @@
     const master = new Tone.Gain(0.75).toDestination();
     const reverb = new Tone.Reverb({ decay: 7, wet: 0.6 }).connect(master);
     await reverb.ready;
-    const lopass = new Tone.Filter({ type: 'lowpass', frequency: 1800, rolloff: -24 })
-                     .connect(reverb);
+    const lopass = new Tone.Filter({ type: 'lowpass', frequency: 1800, rolloff: -24 }).connect(reverb);
 
-    // パッド和音（attack を短くして即座に聴こえる）
     const pad = new Tone.PolySynth(Tone.AMSynth, {
       harmonicity: 2.0,
       oscillator: { type: 'sine' },
@@ -248,16 +280,10 @@
       volume: -14,
     }).connect(lopass);
 
-    // 観客IDから和音を選択（各デバイスが違う和音）
     const aidx = parseInt(socket.id.slice(-4), 16) % 3;
-    const chords = [
-      ['G3','D4','A4'],
-      ['A3','E4','C5'],
-      ['D3','A3','G4'],
-    ];
+    const chords = [['G3','D4','A4'], ['A3','E4','C5'], ['D3','A3','G4']];
     pad.triggerAttack(chords[aidx]);
 
-    // 鈴（散発的）
     const suzuAud = new Tone.MetalSynth({
       frequency: 900, harmonicity: 4.1, modulationIndex: 20,
       resonance: 4000, octaves: 1.0,
@@ -265,29 +291,23 @@
       volume: -18,
     }).connect(reverb);
 
-    // 遠景テクスチャ
     const envFilt = new Tone.Filter({ type: 'bandpass', frequency: 700, Q: 1.2 }).connect(reverb);
     const envNoise = new Tone.Noise('pink');
-    envNoise.volume.value = -32;
-    envNoise.connect(envFilt);
-    envNoise.start();
+    envNoise.volume.value = -32; envNoise.connect(envFilt); envNoise.start();
 
-    // LFO
     const lfoFilt = new Tone.LFO({ frequency: 0.04, min: 500, max: 2000 });
-    lfoFilt.connect(lopass.frequency);
-    lfoFilt.start();
+    lfoFilt.connect(lopass.frequency); lfoFilt.start();
 
     audio = { pad, suzuAud, envNoise, envFilt, lopass, reverb, lfoFilt, master };
 
-    // 鈴：散発自動再生
     function ringRandom() {
       const gap = world.mikoshiCount > 0
-        ? (500 + Math.random() * 2000) / (0.4 + world.totalMovement * 0.25)
-        : 3500 + Math.random() * 2000;
+        ? (500 + Math.random()*2000) / (0.4 + world.totalMovement*0.25)
+        : 3500 + Math.random()*2000;
       setTimeout(() => {
         if (world.mikoshiCount > 0) {
-          suzuAud.frequency.value = 600 + Math.random() * 1000;
-          suzuAud.triggerAttackRelease(Tone.now(), 0.25 + Math.random() * 0.5);
+          suzuAud.frequency.value = 600 + Math.random()*1000;
+          suzuAud.triggerAttackRelease(Tone.now(), 0.25 + Math.random()*0.5);
         }
         ringRandom();
       }, gap);
@@ -299,94 +319,73 @@
     if (!audio.lopass) return;
     const crowd = Math.min(s.mikoshiCount + s.audienceCount, 40) / 40;
     const move  = Math.min(s.totalMovement / 4, 1);
-
-    // 人が増えるとフィルターが開く
-    audio.lopass.frequency.rampTo(600 + crowd * 3000, 1.5);
-    // 動きでリバーブ
-    audio.reverb.wet.rampTo(0.45 + move * 0.4, 1.5);
-    // LFO速度
-    audio.lfoFilt.frequency.rampTo(0.03 + move * 0.18, 2);
-    // テクスチャ音量
-    audio.envNoise.volume.rampTo(-36 + move * 12 + (s.maxMic * 6), 0.5);
-
-    if (s.mikoshiCount === 0) {
-      audio.pad.releaseAll(Tone.now() + 3);
-    }
+    audio.lopass.frequency.rampTo(600 + crowd*3000, 1.5);
+    audio.reverb.wet.rampTo(0.45 + move*0.4, 1.5);
+    audio.lfoFilt.frequency.rampTo(0.03 + move*0.18, 2);
+    audio.envNoise.volume.rampTo(-36 + move*12 + s.maxMic*6, 0.5);
+    if (s.mikoshiCount === 0) audio.pad.releaseAll(Tone.now() + 3);
   }
 
   // ============================================================
   //  エフェクト canvas（波紋）
   // ============================================================
-  function startFx() {
+  (function startFx() {
     const canvas = document.getElementById('fx');
     const ctx = canvas.getContext('2d');
     let W, H;
-    const resize = () => {
-      W = canvas.width  = window.innerWidth;
-      H = canvas.height = window.innerHeight;
-    };
+    const resize = () => { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; };
     resize();
     window.addEventListener('resize', resize);
 
     const ripples = [];
     let lastRipple = 0;
 
-    function addRipple(x, y, hue, maxR) {
-      ripples.push({ x, y, r: 5, maxR, alpha: 0.4, hue });
-    }
-
     function loop() {
       requestAnimationFrame(loop);
-      // 残像（薄く消えていく）
       ctx.fillStyle = 'rgba(0,0,0,0.06)';
       ctx.fillRect(0, 0, W, H);
 
       const { devices, totalMovement, avgBrightness, avgColorTemp } = world;
-      const now  = performance.now();
-      const gap  = Math.max(120, 750 - totalMovement * 60);
+      const now = performance.now();
+      const gap = Math.max(120, 750 - totalMovement * 60);
 
       if (devices.length > 0 && now - lastRipple > gap) {
         lastRipple = now;
         devices.forEach((d, i) => {
-          const angle = (i / Math.max(devices.length, 1)) * Math.PI * 2;
-          const cx = W * 0.5 + Math.cos(angle) * W * 0.2;
-          const cy = H * 0.5 + Math.sin(angle) * H * 0.18;
-          const hue = avgColorTemp * 50 + 10;
+          const angle = (i / Math.max(devices.length,1)) * Math.PI * 2;
+          const cx = W*0.5 + Math.cos(angle)*W*0.2;
+          const cy = H*0.5 + Math.sin(angle)*H*0.18;
+          const hue = avgColorTemp*50 + 10;
           const maxR = 90 + (d.accMagnitude||0.2)*260 + (d.micLevel||0)*100;
-          addRipple(cx, cy, hue, maxR);
+          ripples.push({ x:cx, y:cy, r:5, maxR, alpha:0.4, hue });
         });
       }
-      // 担ぎ手ゼロ時は中央から静かに
       if (devices.length === 0 && now - lastRipple > 3000) {
         lastRipple = now;
-        addRipple(W * 0.5, H * 0.5, 210, 70);
+        ripples.push({ x:W*0.5, y:H*0.5, r:5, maxR:70, alpha:0.3, hue:210 });
       }
 
-      // 描画
       const speed = 1.3 + totalMovement * 0.75;
-      for (let i = ripples.length - 1; i >= 0; i--) {
+      for (let i = ripples.length-1; i >= 0; i--) {
         const rp = ripples[i];
-        rp.r     += speed;
-        rp.alpha -= 0.004;
-        if (rp.alpha <= 0 || rp.r > rp.maxR) { ripples.splice(i, 1); continue; }
-        const prog = 1 - rp.r / rp.maxR;
+        rp.r += speed; rp.alpha -= 0.004;
+        if (rp.alpha <= 0 || rp.r > rp.maxR) { ripples.splice(i,1); continue; }
+        const prog = 1 - rp.r/rp.maxR;
         ctx.beginPath();
-        ctx.arc(rp.x, rp.y, rp.r, 0, Math.PI * 2);
-        ctx.strokeStyle = `hsla(${rp.hue}, 85%, 65%, ${rp.alpha * prog})`;
-        ctx.lineWidth   = 1.5 * prog * 2.5;
+        ctx.arc(rp.x, rp.y, rp.r, 0, Math.PI*2);
+        ctx.strokeStyle = `hsla(${rp.hue},85%,65%,${rp.alpha*prog})`;
+        ctx.lineWidth   = 1.5*prog*2.5;
         ctx.stroke();
       }
-
-      // 散乱光点
-      if (Math.random() < 0.06 * (0.5 + avgBrightness)) {
+      if (Math.random() < 0.06*(0.5+avgBrightness)) {
         ctx.beginPath();
         ctx.arc(Math.random()*W, Math.random()*H, Math.random()*1.5, 0, Math.PI*2);
-        ctx.fillStyle = `hsla(${avgColorTemp*40+20}, 70%, 88%, ${Math.random()*0.3})`;
+        ctx.fillStyle = `hsla(${avgColorTemp*40+20},70%,88%,${Math.random()*0.3})`;
         ctx.fill();
       }
     }
     loop();
-  }
+  })();
   </script>
 </body>
 </html>
