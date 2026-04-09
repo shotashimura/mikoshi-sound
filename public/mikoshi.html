@@ -72,6 +72,7 @@
   let granularDest = null;  // MediaStreamDestinationNode → WebRTC audio track
   let granEngine   = null;  // GranularEngine instance
   let fueObj       = null;  // fue oscillator refs
+  let fue2Obj      = null;  // 第2笛（ハーモニー）
   let _audioRefs   = null;  // instrument bus refs for updateLoop
   let micAnalyser  = null;
   let micBuf       = null;
@@ -656,7 +657,207 @@
     fueOsc.connect(fueGain); fueGain.connect(output);
     fueOsc.start(); vibLFO.start();
 
-    return { breathFilt, breathGain, fueOsc, vibGain, fueGain };
+    return { breathFilt, breathGain, fueOsc, vibLFO, vibGain, fueGain };
+  }
+
+  // ============================================================
+  //  追加楽器: 小鼓・締太鼓・拍子木・鈴・鉦連打
+  // ============================================================
+
+  // 小鼓 (kotsuzumi) — 胴鳴り「ポン」音
+  function hitKotsuzumi(ctx, output, freq, vel) {
+    const now = ctx.currentTime;
+    const sr  = ctx.sampleRate;
+    const nb = ctx.createBuffer(1, Math.floor(sr * 0.25), sr);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns = ctx.createBufferSource(); ns.buffer = nb;
+    const f  = ctx.createBiquadFilter();
+    f.type   = 'bandpass'; f.frequency.value = freq * 2.2; f.Q.value = 5.0;
+    const g  = ctx.createGain();
+    g.gain.setValueAtTime(vel * 1.3, now);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.20);
+    ns.connect(f); f.connect(g); g.connect(output);
+    ns.start(now); ns.stop(now + 0.22);
+    const osc = ctx.createOscillator(); osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq * 3.8, now);
+    osc.frequency.exponentialRampToValueAtTime(freq * 1.6, now + 0.14);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(vel * 0.60, now);
+    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+    osc.connect(og); og.connect(output);
+    osc.start(now); osc.stop(now + 0.18);
+  }
+
+  // 締太鼓 (shime-daiko) — タイトな高域打音
+  function hitShimeDaiko(ctx, output, freq, vel) {
+    const now = ctx.currentTime;
+    const sr  = ctx.sampleRate;
+    const nb = ctx.createBuffer(1, Math.floor(sr * 0.10), sr);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns = ctx.createBufferSource(); ns.buffer = nb;
+    const f  = ctx.createBiquadFilter();
+    f.type   = 'bandpass'; f.frequency.value = freq * 4.0; f.Q.value = 3.5;
+    const g  = ctx.createGain();
+    g.gain.setValueAtTime(vel * 1.8, now);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
+    ns.connect(f); f.connect(g); g.connect(output);
+    ns.start(now); ns.stop(now + 0.10);
+    const osc = ctx.createOscillator(); osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq * 5.5, now);
+    osc.frequency.exponentialRampToValueAtTime(freq * 2.2, now + 0.06);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(vel * 0.70, now);
+    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
+    osc.connect(og); og.connect(output);
+    osc.start(now); osc.stop(now + 0.09);
+  }
+
+  // 拍子木 (hyoshigi) — 乾いた木の打音
+  function hitHyoshigi(ctx, output, vel) {
+    const now = ctx.currentTime;
+    const sr  = ctx.sampleRate;
+    const nb = ctx.createBuffer(1, Math.floor(sr * 0.035), sr);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns = ctx.createBufferSource(); ns.buffer = nb;
+    const hf = ctx.createBiquadFilter(); hf.type = 'highpass'; hf.frequency.value = 1800;
+    const g  = ctx.createGain();
+    g.gain.setValueAtTime(vel * 2.2, now);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.030);
+    ns.connect(hf); hf.connect(g); g.connect(output);
+    ns.start(now); ns.stop(now + 0.038);
+    const osc = ctx.createOscillator(); osc.type = 'sine';
+    osc.frequency.value = 1350 + Math.random() * 300;
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(vel * 0.50, now + 0.002);
+    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+    osc.connect(og); og.connect(output);
+    osc.start(now); osc.stop(now + 0.15);
+  }
+
+  // 鈴 (suzu) — 揺れる鈴（デチューンしたサイン波クラスター）
+  function hitSuzu(ctx, output, baseFreq, vel) {
+    const now   = ctx.currentTime;
+    const parts = [
+      { f: baseFreq,          amp: 0.32, dec: 0.55 },
+      { f: baseFreq * 1.005,  amp: 0.25, dec: 0.48 },
+      { f: baseFreq * 0.997,  amp: 0.22, dec: 0.52 },
+      { f: baseFreq * 2.010,  amp: 0.18, dec: 0.38 },
+      { f: baseFreq * 2.008,  amp: 0.14, dec: 0.32 },
+      { f: baseFreq * 3.012,  amp: 0.09, dec: 0.25 },
+    ];
+    parts.forEach(({ f, amp, dec }, i) => {
+      const osc = ctx.createOscillator(); osc.type = 'sine';
+      osc.frequency.value = f;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(vel * amp, now + i * 0.007);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dec);
+      osc.connect(g); g.connect(output);
+      osc.start(now + i * 0.007); osc.stop(now + dec + 0.05);
+    });
+  }
+
+  // 鉦連打 (チンチキチン pattern) — チン・チキ・チン
+  function hitKaneBurst(ctx, output, baseFreq, vel) {
+    const timings = [0, 105, 185, 330];
+    const vels    = [1.0, 0.45, 0.42, 0.88];
+    timings.forEach((ms, i) => {
+      setTimeout(() => {
+        if (!ctx) return;
+        hitKane(ctx, output, baseFreq * (1 + (Math.random() - 0.5) * 0.03), vel * vels[i]);
+      }, ms);
+    });
+  }
+
+  // ============================================================
+  //  屋台囃子 自律リズムループ
+  //  センサーなしでも鳴り続ける基本リズム
+  //  S.accMag・S.brightness・tempoDetector に連動してダイナミクス変化
+  // ============================================================
+  function startHayashiRhythm(bus, taikoF, kaneF) {
+    let beatN = 0;
+
+    function tick() {
+      if (!audioCtx) return;
+
+      const conf   = tempoDetector.effectiveConfidence();
+      const bpm    = conf > 0.25
+        ? Math.min(155, Math.max(85, tempoDetector.getBPM()))
+        : 105 + S.accMag * 28;
+      const beatMs = 60000 / bpm;
+      const vel    = 0.18 + S.accMag * 0.38 + S.brightness * 0.10;
+
+      beatN++;
+
+      // ── ビート1: 太鼓（常に） ──
+      hitTaiko(audioCtx, bus, taikoF, vel * (0.72 + Math.random() * 0.28));
+
+      // ── ビート1.5: 小鼓（裏拍） ──
+      if (Math.random() < 0.82) {
+        setTimeout(() => hitKotsuzumi(audioCtx, bus, taikoF * 2.5, vel * 0.65),
+                   beatMs * 0.5 | 0);
+      }
+
+      // ── ビート1.67: 太鼓どこドン ──
+      if (Math.random() < 0.68) {
+        setTimeout(() => hitTaiko(audioCtx, bus, taikoF, vel * 0.52),
+                   beatMs * 0.67 | 0);
+      }
+
+      // ── ビート2: 締太鼓 ──
+      if (Math.random() < 0.60) {
+        setTimeout(() => hitShimeDaiko(audioCtx, bus, taikoF, vel * 0.78),
+                   beatMs * 1.0 | 0);
+      }
+
+      // ── ビート2.5: 小鼓 ──
+      if (Math.random() < 0.65) {
+        setTimeout(() => hitKotsuzumi(audioCtx, bus, taikoF * 2.5, vel * 0.50),
+                   beatMs * 1.5 | 0);
+      }
+
+      // ── ビート3: 太鼓（やや軽め） ──
+      if (Math.random() < 0.55) {
+        setTimeout(() => hitTaiko(audioCtx, bus, taikoF, vel * 0.45),
+                   beatMs * 2.0 | 0);
+      }
+
+      // ── ビート3.5: 締太鼓フィル ──
+      if (Math.random() < 0.50) {
+        setTimeout(() => hitShimeDaiko(audioCtx, bus, taikoF, vel * 0.60),
+                   beatMs * 2.5 | 0);
+      }
+
+      // ── 鉦: 3拍ごと ──
+      if (beatN % 3 === 0) {
+        const kd = (beatMs * (0.8 + Math.random() * 0.6)) | 0;
+        setTimeout(() => hitKane(audioCtx, bus, kaneF, vel * 0.82), kd);
+      }
+
+      // ── 鉦連打 チンチキチン: 8拍ごと ──
+      if (beatN % 8 === 0) {
+        setTimeout(() => hitKaneBurst(audioCtx, bus, kaneF, vel * 0.62),
+                   beatMs * 2.2 | 0);
+      }
+
+      // ── 拍子木: まれに ──
+      if (beatN % 14 === 0) {
+        hitHyoshigi(audioCtx, bus, vel * 0.88);
+      }
+
+      // ── 鈴: 動きが大きいとき ──
+      if (S.accMag > 0.30 && Math.random() < 0.42) {
+        setTimeout(() => hitSuzu(audioCtx, bus, kaneF * 2, vel * 0.58),
+                   beatMs * 0.22 | 0);
+      }
+
+      // ── 2拍単位で次へ（±8%のゆらぎ） ──
+      setTimeout(tick, (beatMs * 2 * (0.92 + Math.random() * 0.16)) | 0);
+    }
+
+    setTimeout(tick, 1000);
   }
 
   // ============================================================
@@ -724,8 +925,16 @@
     setTimeout(() => hitTaiko(audioCtx, instrBus, taikoFreq, 0.55), 300);
     setTimeout(() => hitKane(audioCtx, instrBus, kaneFreq),          750);
 
-    // 笛
+    // 笛（主旋律）
     fueObj = createFue(audioCtx, instrBus);
+
+    // 第2笛（4度上のハーモニー）
+    fue2Obj = createFue(audioCtx, instrBus);
+    fue2Obj.fueOsc.frequency.value = YO[Math.min(8 + baseIdx + 3, YO.length - 1)];
+    fue2Obj.fueGain.gain.value     = 0.09;
+    fue2Obj.breathGain.gain.value  = 0.04;
+    fue2Obj.vibGain.gain.value     = 5.5;
+    fue2Obj.vibLFO.frequency.value = 5.9;
 
     // 環境ドローン（低域三角波）
     const droneOsc = audioCtx.createOscillator();
@@ -752,6 +961,9 @@
       envFilt, envGain, droneGain, droneOsc,
     };
 
+    // ── 屋台囃子 自律リズムループ起動 ──
+    startHayashiRhythm(instrBus, taikoFreq, kaneFreq);
+
     // ─── リズムトリガー（加速度ピーク） ───
     let kaneCount = 0;
     onPeak((rel) => {
@@ -759,12 +971,42 @@
       tempoDetector.addPeak(performance.now());
       const vel = Math.min(rel / 5, 1);
       const ni  = Math.max(0, Math.min(baseIdx + Math.floor(S.brightness * 4), YO.length - 1));
-      hitTaiko(audioCtx, instrBus, YO[Math.max(0, ni - 4)], 0.40 + vel * 0.55);
+
+      // 太鼓（主打）
+      hitTaiko(audioCtx, instrBus, YO[Math.max(0, ni - 4)], 0.42 + vel * 0.55);
+
+      // 小鼓（常時、裏拍感）
+      hitKotsuzumi(audioCtx, instrBus, YO[Math.min(ni + 2, YO.length - 1)] * 2, vel * 0.72);
+
+      // 鉦（4打に1回）
       if (++kaneCount % 4 === 0) {
         hitKane(audioCtx, instrBus, kaneFreq * (1 + S.colorTemp * 0.8));
       }
-      if (Math.random() < 0.32) {
+
+      // 鉦（ランダム）
+      if (Math.random() < 0.38) {
         hitKane(audioCtx, instrBus, 650 + Math.random() * 750);
+      }
+
+      // 締太鼓フィル（少し遅れて）
+      if (Math.random() < 0.58) {
+        setTimeout(() => hitShimeDaiko(audioCtx, instrBus, taikoFreq, vel * 0.70),
+                   (75 + Math.random() * 100) | 0);
+      }
+
+      // 鉦連打 チンチキチン（まれに）
+      if (Math.random() < 0.20) {
+        setTimeout(() => hitKaneBurst(audioCtx, instrBus, kaneFreq, vel * 0.62), 200);
+      }
+
+      // 拍子木（まれに）
+      if (Math.random() < 0.15) {
+        hitHyoshigi(audioCtx, instrBus, vel * 0.78);
+      }
+
+      // 鈴（vel 高いとき）
+      if (vel > 0.52 && Math.random() < 0.45) {
+        setTimeout(() => hitSuzu(audioCtx, instrBus, kaneFreq * 2, vel * 0.52), 30);
       }
     });
 
@@ -796,6 +1038,13 @@
         const glide = Math.max(0.08, 0.42 - conf * 0.28);
         fueObj.fueOsc.frequency.linearRampToValueAtTime(freq, t + glide);
         fueObj.breathFilt.frequency.linearRampToValueAtTime(freq * 2.2, t + glide * 0.6);
+
+        // 第2笛（4度上でハーモニー）
+        if (fue2Obj) {
+          const f2idx = Math.max(6, Math.min(fueFreqIdx + 3, YO.length - 1));
+          fue2Obj.fueOsc.frequency.linearRampToValueAtTime(YO[f2idx], t + glide * 1.3);
+          fue2Obj.breathFilt.frequency.linearRampToValueAtTime(YO[f2idx] * 2.1, t + glide * 0.8);
+        }
       }
 
       // 次の発音タイミング = tempoDetector が提案する間隔（人間的ゆらぎ込み）
@@ -872,6 +1121,14 @@
       );
       fueObj.vibGain.gain.linearRampToValueAtTime(
         5 + energy * 14, t + 0.6
+      );
+    }
+    if (fue2Obj) {
+      fue2Obj.fueGain.gain.linearRampToValueAtTime(
+        0.07 + energy * 0.10, t + 0.9
+      );
+      fue2Obj.vibGain.gain.linearRampToValueAtTime(
+        4 + energy * 10, t + 0.7
       );
     }
   }
