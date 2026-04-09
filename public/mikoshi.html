@@ -232,49 +232,191 @@
   }
 
   // ============================================================
-  //  Pillar 1: グラニュラーエンジン
-  //  マイクの環境音を 600ms ずつ録音→粒子再生 → WebRTC 音声トラックへ
+  //  Pillar 1: グラニュラーエンジン（AudioWorklet 版）
+  //
+  //  優先順位:
+  //   1. SharedArrayBuffer + AudioWorklet — 生 PCM をリングバッファに直書き
+  //      (COOP/COEP ヘッダーが設定されている場合のみ利用可能)
+  //   2. postMessage + AudioWorklet     — コーデック圧縮なし Float32 転送
+  //   3. MediaRecorder                  — 最終フォールバック（opus 圧縮あり）
+  //
+  //  リングバッファ仕様:
+  //   RING_SIZE = 2^18 = 262144 サンプル (48kHz で約5.5秒)
+  //   ctrl[0] = writePos, ctrl[1] = hasWrapped(0/1)
   // ============================================================
   class GranularEngine {
     constructor(ctx, outputNode) {
-      this.ctx     = ctx;
-      this.output  = outputNode;
-      this.buffers = [];
-      this.maxBufs = 6;
+      this.ctx    = ctx;
+      this.output = outputNode;
+      this.pitch  = 1.0;
+      this.spread = 0.7;
+      this.density = 80;   // ms/grain (センサーで変調)
       this.running = false;
-      this.pitch   = 1.0;    // センサーで変調
-      this.spread  = 0.7;    // ステレオ広がり
-      this.density = 85;     // ms/grain
+
+      // Mode A: SharedArrayBuffer リングバッファ
+      this.RING_SIZE  = 1 << 18;   // 262144 サンプル
+      this.ringBuffer = null;      // SharedArrayBuffer (Int16)
+      this.ctrlBuffer = null;      // SharedArrayBuffer (Int32[4])
+      this.ringData   = null;
+      this.ctrlData   = null;
+      this.useShared  = false;
+
+      // Mode B / C: PCM バッファ配列
+      this.pcmBuffers = [];
+      this.maxPCMBufs = 10;
     }
 
-    start(micStream) {
+    async start(micStream) {
       this.running = true;
-      this._captureLoop(micStream);
+      const hasShared = typeof SharedArrayBuffer !== 'undefined';
+
+      try {
+        await this.ctx.audioWorklet.addModule('/worklet/mic-capture.js');
+        const micSrc     = this.ctx.createMediaStreamSource(micStream);
+        const captureNode = new AudioWorkletNode(this.ctx, 'mic-capture-processor');
+
+        if (hasShared) {
+          // ── Mode A: SharedArrayBuffer ──────────────────────
+          this.ringBuffer = new SharedArrayBuffer(this.RING_SIZE * 2); // Int16
+          this.ctrlBuffer = new SharedArrayBuffer(16);                 // Int32[4]
+          this.ringData   = new Int16Array(this.ringBuffer);
+          this.ctrlData   = new Int32Array(this.ctrlBuffer);
+
+          captureNode.port.postMessage({
+            type: 'init-shared',
+            ring: this.ringBuffer,
+            ctrl: this.ctrlBuffer,
+          });
+          this.useShared = true;
+          console.log('[granular] Mode A: SharedArrayBuffer リングバッファ');
+
+        } else {
+          // ── Mode B: postMessage フォールバック ──────────────
+          captureNode.port.postMessage({ type: 'init-pm' });
+          captureNode.port.onmessage = ({ data }) => {
+            if (data.type !== 'pcm') return;
+            try {
+              const sr      = this.ctx.sampleRate;
+              const float32 = new Float32Array(data.buffer);
+              const buf     = this.ctx.createBuffer(1, float32.length, sr);
+              buf.copyToChannel(float32, 0);
+              this.pcmBuffers.push(buf);
+              if (this.pcmBuffers.length > this.maxPCMBufs) this.pcmBuffers.shift();
+            } catch (_) {}
+          };
+          console.log('[granular] Mode B: postMessage PCM 転送');
+        }
+
+        // ワークレットを audio graph に保持するためサイレンサーに接続
+        const silencer = this.ctx.createGain();
+        silencer.gain.value = 0;
+        micSrc.connect(captureNode);
+        captureNode.connect(silencer);
+        silencer.connect(this.ctx.destination);
+
+      } catch (e) {
+        console.warn('[granular] AudioWorklet 失敗 → MediaRecorder フォールバック:', e);
+        this._startMediaRecorder(micStream);
+      }
+
       this._grainLoop();
     }
 
     stop() { this.running = false; }
 
-    _captureLoop(stream) {
+    // ── Mode A: SharedArrayBuffer から粒子を再生 ───────────
+    _playGrainShared() {
+      const wPos       = Atomics.load(this.ctrlData, 0);
+      const hasWrapped = Atomics.load(this.ctrlData, 1);
+      const RING       = this.RING_SIZE;
+      const sr         = this.ctx.sampleRate;
+
+      const validSamples  = hasWrapped ? RING : wPos;
+      const durSamples    = Math.floor(sr * (0.055 + Math.random() * 0.13));
+      const safeZone      = Math.floor(sr * 0.08);  // 直近 80ms は書き込み中の可能性があるので除外
+      const maxLookback   = Math.min(validSamples - safeZone - durSamples,
+                                     Math.floor(sr * 4.5));
+
+      if (maxLookback < durSamples) return; // バッファがまだ十分に溜まっていない
+
+      const lookback   = safeZone + durSamples + Math.floor(Math.random() * (maxLookback - durSamples));
+      const grainStart = ((wPos - lookback) % RING + RING) % RING;
+
+      // リングバッファから AudioBuffer を生成（Int16 → float32）
+      const buf  = this.ctx.createBuffer(1, durSamples, sr);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < durSamples; i++) {
+        data[i] = this.ringData[(grainStart + i) % RING] / 32767;
+      }
+      this._scheduleGrain(buf, 0, durSamples / sr);
+    }
+
+    // ── Mode B / C: AudioBuffer 配列から粒子を再生 ─────────
+    _playGrainBuffer() {
+      if (!this.pcmBuffers.length) return;
+      const buf = this.pcmBuffers[Math.floor(Math.random() * this.pcmBuffers.length)];
+      if (!buf || buf.duration < 0.04) return;
+
+      const sr         = this.ctx.sampleRate;
+      const grainDur   = 0.055 + Math.random() * 0.13;
+      const maxStart   = Math.max(0, buf.duration - grainDur);
+      const startSec   = Math.random() * maxStart;
+      this._scheduleGrain(buf, startSec, grainDur);
+    }
+
+    // ── 粒子スケジューラ共通処理（Hanning エンベロープ＋パン）─
+    _scheduleGrain(buf, startSec, durSec) {
+      const now = this.ctx.currentTime;
+      const src = this.ctx.createBufferSource();
+      src.buffer             = buf;
+      src.playbackRate.value = this.pitch * (0.83 + Math.random() * 0.34);
+
+      const env = this.ctx.createGain();
+      env.gain.setValueAtTime(0, now);
+      env.gain.linearRampToValueAtTime(0.42, now + durSec * 0.15);
+      env.gain.setValueAtTime(0.42,          now + durSec * 0.85);
+      env.gain.linearRampToValueAtTime(0,    now + durSec);
+
+      const pan = this.ctx.createStereoPanner();
+      pan.pan.value = (Math.random() - 0.5) * this.spread;
+
+      src.connect(env); env.connect(pan); pan.connect(this.output);
+      src.start(now, startSec, durSec + 0.01);
+    }
+
+    _playGrain() {
+      if (this.useShared)          this._playGrainShared();
+      else if (this.pcmBuffers.length) this._playGrainBuffer();
+    }
+
+    _grainLoop() {
+      const tick = () => {
+        if (!this.running) return;
+        this._playGrain();
+        setTimeout(tick, this.density * (0.5 + Math.random()));
+      };
+      tick();
+    }
+
+    // ── Mode C: MediaRecorder 最終フォールバック ────────────
+    _startMediaRecorder(stream) {
       const doCapture = () => {
         if (!this.running) return;
         let mimeType = '';
-        for (const m of ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','']) {
+        for (const m of ['audio/webm;codecs=opus', 'audio/webm', '']) {
           if (!m || MediaRecorder.isTypeSupported(m)) { mimeType = m; break; }
         }
         try {
-          const opts = mimeType ? { mimeType } : {};
-          const mr   = new MediaRecorder(stream, opts);
+          const mr     = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
           const chunks = [];
-          mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+          mr.ondataavailable = (e) => { if (e.data?.size > 0) chunks.push(e.data); };
           mr.onstop = async () => {
             try {
               const blob    = new Blob(chunks, { type: mr.mimeType || 'audio/webm' });
-              const ab      = await blob.arrayBuffer();
-              const decoded = await this.ctx.decodeAudioData(ab.slice(0));
-              if (decoded && decoded.duration > 0.04) {
-                this.buffers.push(decoded);
-                if (this.buffers.length > this.maxBufs) this.buffers.shift();
+              const decoded = await this.ctx.decodeAudioData(await blob.arrayBuffer());
+              if (decoded?.duration > 0.04) {
+                this.pcmBuffers.push(decoded);
+                if (this.pcmBuffers.length > 6) this.pcmBuffers.shift();
               }
             } catch (_) {}
             if (this.running) setTimeout(doCapture, 50);
@@ -282,49 +424,10 @@
           mr.start();
           setTimeout(() => { try { if (mr.state === 'recording') mr.stop(); } catch (_) {} }, 600);
         } catch (e) {
-          console.warn('[granular] capture:', e);
           setTimeout(() => { if (this.running) doCapture(); }, 1200);
         }
       };
       doCapture();
-    }
-
-    _playGrain() {
-      if (!this.buffers.length) return;
-      const buf = this.buffers[Math.floor(Math.random() * this.buffers.length)];
-      if (!buf || buf.duration < 0.04) return;
-
-      const dur      = 0.055 + Math.random() * 0.13;  // 55–185 ms
-      const startPos = Math.random() * Math.max(0.001, buf.duration - dur);
-      const now      = this.ctx.currentTime;
-
-      const src = this.ctx.createBufferSource();
-      src.buffer           = buf;
-      src.playbackRate.value = this.pitch * (0.83 + Math.random() * 0.34);
-
-      // Hanning ウィンドウエンベロープ
-      const env = this.ctx.createGain();
-      env.gain.setValueAtTime(0, now);
-      env.gain.linearRampToValueAtTime(0.42, now + dur * 0.15);
-      env.gain.setValueAtTime(0.42, now + dur * 0.85);
-      env.gain.linearRampToValueAtTime(0, now + dur);
-
-      const pan = this.ctx.createStereoPanner();
-      pan.pan.value = (Math.random() - 0.5) * this.spread;
-
-      src.connect(env);
-      env.connect(pan);
-      pan.connect(this.output);
-      src.start(now, startPos, dur + 0.01);
-    }
-
-    _grainLoop() {
-      const tick = () => {
-        if (!this.running) return;
-        this._playGrain();
-        setTimeout(tick, this.density * (0.5 + Math.random() * 1.0));
-      };
-      tick();
     }
   }
 

@@ -12,6 +12,14 @@ const io     = new Server(server, {
   pingTimeout:  15000,
 });
 
+// SharedArrayBuffer を使うには Cross-Origin Isolation が必要
+// COOP + COEP ヘッダーをすべてのレスポンスに付与する
+app.use((req, res, next) => {
+  res.setHeader('Cross-Origin-Opener-Policy',   'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/',         (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 app.get('/mikoshi',  (_, res) => res.sendFile(path.join(__dirname, 'public', 'mikoshi.html')));
