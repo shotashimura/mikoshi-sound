@@ -432,6 +432,109 @@
   }
 
   // ============================================================
+  //  テンポ検出器
+  //  加速度センサーのピーク時刻を蓄積し、打ち間隔の中央値から
+  //  担ぎ手の「おおよそのテンポ」を推定する。
+  //
+  //  設計方針:
+  //   - 直近 8 ピークの間隔を記録
+  //   - 外れ値除去（中央値の 0.4〜2.5 倍の範囲外は棄却）
+  //   - 新しいピークほど重みを大きくした加重平均でテンポを平滑化
+  //   - CV（変動係数）でテンポの一貫性を 0-1 の confidence として表現
+  //   - ピークが途絶えると confidence が時間減衰する
+  //   - getFueInterval(): テンポ×フレーズ長(1–3 拍) + ±15% 人間的ゆらぎ
+  // ============================================================
+  class TempoDetector {
+    constructor() {
+      this.times      = [];      // 直近ピーク時刻(ms)の circular buffer
+      this.maxPeaks   = 8;
+      this.tempoMs    = 1000;    // 現在の推定テンポ間隔(ms)
+      this.confidence = 0;       // 0-1: テンポの一貫性
+      this.lastPeak   = 0;       // 最後にピークを受けた時刻
+      // 許容テンポ範囲
+      this.MIN_INTERVAL = 220;   // ~270 BPM
+      this.MAX_INTERVAL = 2800;  // ~21 BPM
+    }
+
+    addPeak(timestamp) {
+      // 短すぎる間隔のピークは無視（センサーノイズ対策）
+      if (this.lastPeak && timestamp - this.lastPeak < this.MIN_INTERVAL) return;
+      this.lastPeak = timestamp;
+      this.times.push(timestamp);
+      if (this.times.length > this.maxPeaks) this.times.shift();
+      this._update();
+    }
+
+    _update() {
+      if (this.times.length < 3) return;
+
+      // 連続ピーク間の間隔を計算
+      const intervals = [];
+      for (let i = 1; i < this.times.length; i++) {
+        const d = this.times[i] - this.times[i - 1];
+        if (d >= this.MIN_INTERVAL && d <= this.MAX_INTERVAL) intervals.push(d);
+      }
+      if (intervals.length < 2) return;
+
+      // 中央値を基準に外れ値除去（拍落ちや二重打ちを弾く）
+      const sorted = [...intervals].sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+      const valid  = intervals.filter(d => d >= median * 0.40 && d <= median * 2.50);
+      if (valid.length < 2) return;
+
+      // 新しいほど高い重みで加重平均
+      let wSum = 0, wAvg = 0;
+      valid.forEach((d, i) => {
+        const w = i + 1;
+        wAvg += d * w; wSum += w;
+      });
+      const estimate = wAvg / wSum;
+
+      // テンポをゆっくり更新（急激な変化を抑制）
+      this.tempoMs = this.tempoMs * 0.65 + estimate * 0.35;
+
+      // confidence = 間隔の安定度（CV が小さいほど高い）
+      const mean  = valid.reduce((s, d) => s + d, 0) / valid.length;
+      const variance = valid.reduce((s, d) => s + (d - mean) ** 2, 0) / valid.length;
+      const cv    = Math.sqrt(variance) / mean;   // 0 = 完全均一, >0.3 = バラバラ
+      this.confidence = Math.max(0, Math.min(1, 1 - cv * 3.2));
+    }
+
+    // テンポ信頼度（ピークが途絶えると減衰）
+    effectiveConfidence() {
+      const elapsed = performance.now() - this.lastPeak;
+      const decay   = Math.max(0, 1 - elapsed / (this.tempoMs * 4));
+      return this.confidence * decay;
+    }
+
+    // 笛フレーズの次の間隔(ms)を返す
+    // ── テンポ × フレーズ拍数 × 人間的ゆらぎ ──
+    getFueInterval(accMag) {
+      const conf = this.effectiveConfidence();
+
+      // テンポベースの間隔（1〜3 拍ぶん）
+      const beats        = 1 + Math.random() * 2;
+      const tempoInterval = this.tempoMs * beats;
+
+      // フォールバック（テンポ未確立時は accMag ベース）
+      const fallback     = Math.max(350, 1300 / (0.5 + accMag * 1.5));
+
+      // confidence でブレンド
+      const base = conf > 0.25
+        ? tempoInterval * conf + fallback * (1 - conf)
+        : fallback;
+
+      // ±15% 人間的ゆらぎ（打ちのユラギがそのまま音楽性に）
+      const jitter = 0.85 + Math.random() * 0.30;
+      return Math.max(240, base * jitter);
+    }
+
+    getBPM() { return 60000 / this.tempoMs; }
+  }
+
+  const tempoDetector = new TempoDetector();
+
+  // ============================================================
   //  Pillar 3: ピュア Web Audio API お囃子楽器
   // ============================================================
 
@@ -652,6 +755,8 @@
     // ─── リズムトリガー（加速度ピーク） ───
     let kaneCount = 0;
     onPeak((rel) => {
+      // テンポ検出器にピーク時刻を登録（担ぎリズムを学習）
+      tempoDetector.addPeak(performance.now());
       const vel = Math.min(rel / 5, 1);
       const ni  = Math.max(0, Math.min(baseIdx + Math.floor(S.brightness * 4), YO.length - 1));
       hitTaiko(audioCtx, instrBus, YO[Math.max(0, ni - 4)], 0.40 + vel * 0.55);
@@ -663,20 +768,38 @@
       }
     });
 
-    // ─── 笛フレーズ自動進行 ───
+    // ─── 笛フレーズ自動進行（テンポ連動版） ───
+    // tempoDetector の confidence が高いほど:
+    //   ・音符移動が積極的になる（確信を持って動く）
+    //   ・フレーズ間隔が担ぎ手のリズムに引き寄せられる
+    //   ・ステップが大きくなる（テンポが安定しているときは跳躍も増える）
+    // confidence が低い(テンポ未確立)ときは従来の accMag ベースで漂う
     let fueFreqIdx = Math.min(8 + baseIdx, YO.length - 3);
     function advanceFue() {
-      if (Math.random() < 0.45 + S.accMag * 0.45) {
-        fueFreqIdx += (Math.random() < 0.6 ? 1 : -1) * (Math.random() < 0.72 ? 1 : 2);
-        fueFreqIdx  = Math.max(6, Math.min(YO.length - 1, fueFreqIdx));
+      const conf = tempoDetector.effectiveConfidence();
+
+      // 移動確率: テンポが安定しているほど積極的に動く
+      const moveProb = 0.30 + conf * 0.45 + S.accMag * 0.18;
+      if (Math.random() < moveProb) {
+        // confidence が高いとき: 大きなステップ(跳躍)も許可
+        const bigStep  = Math.random() < 0.25 + conf * 0.25;
+        const step     = bigStep ? 2 : 1;
+        const dir      = Math.random() < 0.58 ? 1 : -1;  // 少し上昇傾向
+        fueFreqIdx    += dir * step;
+        fueFreqIdx     = Math.max(6, Math.min(YO.length - 1, fueFreqIdx));
       }
+
       const freq = YO[fueFreqIdx];
       if (fueObj && audioCtx) {
         const t = audioCtx.currentTime;
-        fueObj.fueOsc.frequency.linearRampToValueAtTime(freq, t + 0.38);
-        fueObj.breathFilt.frequency.linearRampToValueAtTime(freq * 2.2, t + 0.22);
+        // テンポが速いほどポルタメントも短く（切れ味が出る）
+        const glide = Math.max(0.08, 0.42 - conf * 0.28);
+        fueObj.fueOsc.frequency.linearRampToValueAtTime(freq, t + glide);
+        fueObj.breathFilt.frequency.linearRampToValueAtTime(freq * 2.2, t + glide * 0.6);
       }
-      const ms = Math.max(300, (0.8 + Math.random() * 1.8) / (0.5 + S.accMag * 1.5) * 1000);
+
+      // 次の発音タイミング = tempoDetector が提案する間隔（人間的ゆらぎ込み）
+      const ms = tempoDetector.getFueInterval(S.accMag);
       setTimeout(advanceFue, ms);
     }
     advanceFue();
