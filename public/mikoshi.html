@@ -733,10 +733,24 @@
   function applyWorldToAudio(s) {
     if (!_audioRefs || !audioCtx) return;
     audienceCount = s.audienceCount;
+    const crowd  = Math.min((s.audienceCount  || 0) / 20, 1);
+    const energy = Math.min(s.avgAudienceEnergy || 0, 1);
+    const t      = audioCtx.currentTime;
+
+    // 観客が盛り上がるほどリバーブが深まる（音が「返ってくる」感覚）
     _audioRefs.rvSend.gain.linearRampToValueAtTime(
-      0.3 + Math.min(s.audienceCount / 20, 1) * 0.45,
-      audioCtx.currentTime + 2
+      0.28 + crowd * 0.32 + energy * 0.22, t + 1.5
     );
+
+    // 観客エネルギーで笛の音量・ビブラートが活発になる
+    if (fueObj) {
+      fueObj.fueGain.gain.linearRampToValueAtTime(
+        0.18 + energy * 0.16, t + 0.8
+      );
+      fueObj.vibGain.gain.linearRampToValueAtTime(
+        5 + energy * 14, t + 0.6
+      );
+    }
   }
 
   function lerp(a, b, t) { return a + (b - a) * t; }

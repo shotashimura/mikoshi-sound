@@ -41,8 +41,9 @@ app.get('/api/qr', async (req, res) => {
 //  状態管理
 // ============================================================
 const state = {
-  mikoshiDevices: new Map(),  // socketId → センサーデータ
+  mikoshiDevices:  new Map(),  // socketId → センサーデータ
   audienceDevices: new Set(),
+  audienceEnergy:  new Map(),  // socketId → 群衆エネルギー (0-1)
   voiceIndex: 0,
 };
 
@@ -56,14 +57,22 @@ function computeWorldState() {
   }
   const avg = (k) => devices.reduce((s, d) => s + (d[k] ?? 0), 0) / n;
   const max = (k) => Math.max(...devices.map((d) => d[k] ?? 0));
+
+  // 観客マイクの群衆エネルギー平均
+  const energyVals = Array.from(state.audienceEnergy.values());
+  const avgAudienceEnergy = energyVals.length > 0
+    ? energyVals.reduce((s, v) => s + v, 0) / energyVals.length
+    : 0;
+
   return {
-    mikoshiCount:  n,
-    audienceCount: state.audienceDevices.size,
-    avgBrightness: avg('brightness'),
-    avgWhiteRatio: avg('whiteRatio'),
-    avgColorTemp:  avg('colorTemp'),
-    totalMovement: devices.reduce((s, d) => s + (d.accMagnitude ?? 0), 0),
-    maxMic:        max('micLevel'),
+    mikoshiCount:       n,
+    audienceCount:      state.audienceDevices.size,
+    avgBrightness:      avg('brightness'),
+    avgWhiteRatio:      avg('whiteRatio'),
+    avgColorTemp:       avg('colorTemp'),
+    totalMovement:      devices.reduce((s, d) => s + (d.accMagnitude ?? 0), 0),
+    maxMic:             max('micLevel'),
+    avgAudienceEnergy,  // 観客の歓声・拍手エネルギー (0-1)
     devices: devices.map((d) => ({
       id: d.id, voiceIndex: d.voiceIndex,
       brightness: d.brightness, accMagnitude: d.accMagnitude,
@@ -118,6 +127,13 @@ io.on('connection', (socket) => {
     console.log(`[audience] ${socket.id}`);
   });
 
+  // ── 観客マイク群衆エネルギー ───────────────────────────
+  socket.on('audience_energy', ({ level }) => {
+    if (socket.role !== 'audience') return;
+    state.audienceEnergy.set(socket.id, clamp(level, 0, 1));
+    scheduleBroadcast();
+  });
+
   // ── センサーデータ ─────────────────────────────────────
   socket.on('sensor_data', (data) => {
     if (socket.role !== 'mikoshi') return;
@@ -168,6 +184,7 @@ io.on('connection', (socket) => {
       io.to('audience').emit('broadcaster_left', { broadcasterId: socket.id });
     } else if (socket.role === 'audience') {
       state.audienceDevices.delete(socket.id);
+      state.audienceEnergy.delete(socket.id);
     }
     scheduleBroadcast();
     console.log(`[-] ${socket.id} (${socket.role})`);

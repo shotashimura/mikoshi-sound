@@ -101,11 +101,18 @@
   let audioReady  = false;
 
   // Web Audio API グローバル
-  let audienceCtx    = null;
-  let audienceReverb = null;
-  let audienceMaster = null;
-  let audienceComp   = null;
-  let padBus         = null;
+  let audienceCtx        = null;
+  let audienceReverb     = null;
+  let reverbReturnGain   = null;   // リバーブ戻りゲイン（群衆エネルギーで変調）
+  let audienceMaster     = null;
+  let audienceComp       = null;
+  let padBus             = null;
+
+  // 観客マイク検出
+  let audienceMicAnalyser = null;
+  let audienceMicBuf      = null;
+  let crowdExcitement     = 0;     // 0–1 の平滑化済み群衆エネルギー
+  let _lastEnergyEmit     = 0;
 
   // 音声初期化前に届いた WebRTC 音声トラックをキュー
   const pendingAudioTracks = new Map(); // broadcasterId → MediaStreamTrack
@@ -294,8 +301,8 @@
     return conv;
   }
 
-  // 鉦（非調和倍音）
-  function hitKane(ctx, output, baseFreq) {
+  // 鉦（非調和倍音）vel = 音量倍率（デフォルト 1.0）
+  function hitKane(ctx, output, baseFreq, vel = 1.0) {
     const now    = ctx.currentTime;
     const ratios = [1, 2.76, 5.40, 8.93];
     const amps   = [1.0, 0.55, 0.28, 0.14];
@@ -305,7 +312,7 @@
       osc.type  = 'sine';
       osc.frequency.value = baseFreq * r;
       const g = ctx.createGain();
-      g.gain.setValueAtTime(amps[i] * 0.25, now);
+      g.gain.setValueAtTime(amps[i] * 0.25 * vel, now);
       g.gain.exponentialRampToValueAtTime(0.0001, now + decays[i]);
       osc.connect(g); g.connect(output);
       osc.start(now); osc.stop(now + decays[i] + 0.1);
@@ -393,8 +400,12 @@
     audienceComp.attack.value = 0.004; audienceComp.release.value = 0.2;
     audienceComp.connect(audienceMaster);
 
-    audienceReverb = createConvReverb(audienceCtx, 4.5, 3.2);
-    audienceReverb.connect(audienceMaster);
+    audienceReverb   = createConvReverb(audienceCtx, 4.5, 3.2);
+    reverbReturnGain = audienceCtx.createGain();
+    reverbReturnGain.gain.value = 0.70;
+    // reverb → reverbReturnGain → master（群衆エネルギーで wet 深さを変調）
+    audienceReverb.connect(reverbReturnGain);
+    reverbReturnGain.connect(audienceMaster);
 
     // ─── アンビエントパッド（担ぎ手ごとに異なる和音） ───
     const aidx = parseInt(socket.id.slice(-4), 16) % 3;
@@ -444,16 +455,20 @@
     envSrc.connect(envFilt); envFilt.connect(envGain); envGain.connect(audienceReverb);
     envSrc.start();
 
-    // ─── 散発的な鉦（お囃子の間）───
+    // ─── 散発的な鉦（群衆エネルギーで間隔が変化）───
     function ringBell() {
+      // 観客が盛り上がるほど鉦が速くなる
+      const energy = world.avgAudienceEnergy || 0;
       const gap = world.mikoshiCount > 0
-        ? 1000 + Math.random() * 2200
+        ? Math.max(400, 1200 - energy * 800) + Math.random() * 1500
         : 4000 + Math.random() * 3000;
       setTimeout(() => {
         if (world.mikoshiCount > 0 && audienceCtx) {
           const kaneFreqs = [293.66, 329.63, 392.00, 440.00, 523.25];
           const bf = kaneFreqs[Math.floor(Math.random() * kaneFreqs.length)];
-          hitKane(audienceCtx, audienceReverb, bf * (0.8 + world.avgColorTemp * 0.4));
+          // 盛り上がりで音量も上がる
+          const vel = 0.8 + (world.avgAudienceEnergy || 0) * 0.4;
+          hitKane(audienceCtx, audienceReverb, bf * (0.8 + world.avgColorTemp * 0.4), vel);
         }
         ringBell();
       }, gap);
@@ -467,6 +482,99 @@
       connectGranularTrack(track, bid);
     }
     pendingAudioTracks.clear();
+
+    // ─── 観客マイク検出（任意：拒否されても動作継続） ───
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
+        video: false,
+      });
+      audienceMicAnalyser = audienceCtx.createAnalyser();
+      audienceMicAnalyser.fftSize = 256;
+      audienceMicAnalyser.smoothingTimeConstant = 0.35;
+      audienceCtx.createMediaStreamSource(micStream).connect(audienceMicAnalyser);
+      audienceMicBuf = new Uint8Array(audienceMicAnalyser.frequencyBinCount);
+      console.log('[audience] マイク検出有効');
+    } catch (e) {
+      console.log('[audience] マイク無効（検出なしで継続）:', e.message);
+    }
+    startCrowdLoop();
+  }
+
+  // ============================================================
+  //  観客マイク解析 — 歓声・拍手スコアを 0-1 で返す
+  // ============================================================
+  function analyzeCrowd() {
+    if (!audienceMicAnalyser || !audienceMicBuf) return 0;
+    audienceMicAnalyser.getByteFrequencyData(audienceMicBuf);
+
+    const n         = audienceMicBuf.length;
+    const hzPerBin  = (audienceCtx.sampleRate / 2) / n;
+    let total = 0, midSum = 0, highSum = 0, midN = 0, highN = 0;
+
+    for (let i = 0; i < n; i++) {
+      const hz = i * hzPerBin;
+      const v  = audienceMicBuf[i] / 255;
+      total += v;
+      if (hz >= 300 && hz < 2500) { midSum  += v; midN++;  }  // 声域
+      if (hz >= 2500)              { highSum += v; highN++; }  // 拍手・歓声の倍音
+    }
+
+    const overall = total / n;
+    const mid  = midN  > 0 ? midSum  / midN  : 0;
+    const high = highN > 0 ? highSum / highN : 0;
+
+    // 声 0.45 + 拍手高域 0.30 + 全体 0.25 の加重和
+    const score = overall * 0.25 + mid * 0.45 + high * 0.30;
+    return Math.min(1, score * 4.2);
+  }
+
+  // ============================================================
+  //  群衆ループ — 毎フレーム解析 → 音響反映 → サーバーへ送信
+  // ============================================================
+  function startCrowdLoop() {
+    const tick = () => {
+      if (!audioReady || !audienceCtx) { requestAnimationFrame(tick); return; }
+
+      const raw = analyzeCrowd();
+      // 盛り上がりは素早く上昇、落ち着きは緩やかに（拍手の歯切れを残す）
+      const rate = raw > crowdExcitement ? 0.08 : 0.022;
+      crowdExcitement = lerp(crowdExcitement, raw, rate);
+
+      const t  = audienceCtx.currentTime;
+      const ce = crowdExcitement;
+
+      // リバーブリターンゲイン（観客が湧くと空間が広がる感覚）
+      if (reverbReturnGain) {
+        reverbReturnGain.gain.linearRampToValueAtTime(
+          0.60 + ce * 0.55, t + 0.35
+        );
+      }
+
+      // パッド音量（観客の声に呼応して膨らむ）
+      if (padBus && world.mikoshiCount > 0) {
+        padBus.gain.linearRampToValueAtTime(
+          0.10 + ce * 0.22, t + 0.5
+        );
+      }
+
+      // マスターゲイン
+      if (audienceMaster) {
+        audienceMaster.gain.linearRampToValueAtTime(
+          0.72 + ce * 0.18, t + 0.4
+        );
+      }
+
+      // サーバーへ 200ms 間隔で送信
+      const now = performance.now();
+      if (now - _lastEnergyEmit > 200) {
+        _lastEnergyEmit = now;
+        socket.emit('audience_energy', { level: Math.round(ce * 1000) / 1000 });
+      }
+
+      requestAnimationFrame(tick);
+    };
+    tick();
   }
 
   // ============================================================
@@ -474,19 +582,19 @@
   // ============================================================
   function applyWorldToAudio(s) {
     if (!audienceCtx || !audienceMaster) return;
-    const crowd = Math.min(s.mikoshiCount + s.audienceCount, 40) / 40;
-    const move  = Math.min(s.totalMovement / 4, 1);
-    const t     = audienceCtx.currentTime;
+    const move = Math.min(s.totalMovement / 4, 1);
+    const t    = audienceCtx.currentTime;
 
-    // マスターゲイン（にぎわいに応じて）
-    audienceMaster.gain.linearRampToValueAtTime(0.65 + crowd * 0.25, t + 1.5);
-
-    // パッドの音量（担ぎ手がいないと徐々に消える）
-    if (padBus) {
-      const padVol = s.mikoshiCount > 0 ? 0.12 + move * 0.08 : 0.05;
-      padBus.gain.linearRampToValueAtTime(padVol, t + 2.0);
+    // 担ぎ手がいない場合はパッドをフェードダウン
+    if (padBus && s.mikoshiCount === 0) {
+      padBus.gain.linearRampToValueAtTime(0.04, t + 2.5);
     }
+
+    // サーバー集計の観客エネルギーで鉦の間隔を詰める（以降の ringBell へ影響）
+    // ── avgAudienceEnergy は world オブジェクトに格納済みなので参照するだけ ──
   }
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
 
   // ============================================================
   //  エフェクト canvas（波紋）
