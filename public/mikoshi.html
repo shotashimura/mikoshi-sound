@@ -41,10 +41,19 @@
     <div class="hint">タップして開始</div>
   </div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
   <script src="/socket.io/socket.io.js"></script>
   <script>
   'use strict';
+
+  // ============================================================
+  //  四七抜き短音階 (D E G A C) の周波数テーブル
+  // ============================================================
+  const YO = [
+    73.42, 82.41, 98.00, 110.00, 130.81,
+    146.83, 164.81, 196.00, 220.00, 261.63,
+    293.66, 329.63, 392.00, 440.00, 523.25,
+    587.33, 659.26, 784.00,
+  ];
 
   // ============================================================
   //  センサー状態
@@ -53,14 +62,22 @@
     brightness: 0.5, whiteRatio: 0.3, colorTemp: 0.5,
     accMag: 0, accX: 0, accY: 0, mic: 0,
   };
-  let voiceIndex   = 0;
+  let voiceIndex    = 0;
   let audienceCount = 0;
   let cameraStream  = null;
   let audioReady    = false;
 
+  // Web Audio API グローバル
+  let audioCtx     = null;
+  let granularDest = null;  // MediaStreamDestinationNode → WebRTC audio track
+  let granEngine   = null;  // GranularEngine instance
+  let fueObj       = null;  // fue oscillator refs
+  let _audioRefs   = null;  // instrument bus refs for updateLoop
+  let micAnalyser  = null;
+  let micBuf       = null;
+
   // ============================================================
-  //  WebRTC: broadcaster（担ぎ手→観客へ映像配信）
-  //  観客ごとに1つの RTCPeerConnection を作る
+  //  WebRTC: broadcaster（担ぎ手→観客へ映像＋グラニュラー音声）
   // ============================================================
   const ICE_CONFIG = {
     iceServers: [
@@ -76,12 +93,17 @@
     const pc = new RTCPeerConnection(ICE_CONFIG);
     peerConns.set(viewerId, pc);
 
-    // カメラのトラックを追加
+    // 映像トラック
     if (cameraStream) {
-      cameraStream.getTracks().forEach((t) => pc.addTrack(t, cameraStream));
+      cameraStream.getVideoTracks().forEach((t) => pc.addTrack(t, cameraStream));
     }
 
-    // ICE candidate
+    // Pillar 2: グラニュラー音声トラック
+    if (granularDest) {
+      const at = granularDest.stream.getAudioTracks()[0];
+      if (at) pc.addTrack(at, granularDest.stream);
+    }
+
     pc.onicecandidate = (e) => {
       if (e.candidate) socket.emit('ice', { to: viewerId, ice: e.candidate });
     };
@@ -93,7 +115,6 @@
       }
     };
 
-    // Offer 作成
     const offer = await pc.createOffer({ offerToReceiveVideo: false, offerToReceiveAudio: false });
     await pc.setLocalDescription(offer);
     socket.emit('offer', { to: viewerId, offer });
@@ -111,25 +132,21 @@
     if (audioReady) applyWorldToAudio(s);
   });
 
-  // 観客が接続 or ページを開いたとき
   socket.on('viewer_request', async ({ viewerId }) => {
-    if (!cameraStream) return;   // まだカメラが起動していない
+    if (!cameraStream) return;
     await createPeerForViewer(viewerId);
   });
 
-  // 観客から SDP answer が届いた
   socket.on('answer', async ({ from, answer }) => {
     const pc = peerConns.get(from);
     if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
   });
 
-  // ICE candidate
   socket.on('ice', ({ from, ice }) => {
     const pc = peerConns.get(from);
     if (pc && ice) pc.addIceCandidate(new RTCIceCandidate(ice)).catch(() => {});
   });
 
-  // センサー送信（150ms）
   setInterval(() => {
     if (!audioReady) return;
     socket.emit('sensor_data', {
@@ -140,24 +157,23 @@
   }, 150);
 
   // ============================================================
-  //  タップで開始（カメラ + マイク + モーション + 音響）
+  //  タップで開始
   // ============================================================
   document.getElementById('start-screen').addEventListener('pointerdown', async () => {
     document.getElementById('start-screen').remove();
     socket.emit('join_mikoshi');
     await initCamera();
-    await initMic();
+    await initAudio();   // マイクもここで取得
     await initMotion();
-    await initAudio();
     audioReady = true;
   }, { once: true });
 
   // ============================================================
   //  カメラ
   // ============================================================
-  const camEl    = document.getElementById('cam');
-  const anvCtx   = document.getElementById('analysis-canvas')
-                     .getContext('2d', { willReadFrequently: true });
+  const camEl  = document.getElementById('cam');
+  const anvCtx = document.getElementById('analysis-canvas')
+                   .getContext('2d', { willReadFrequently: true });
 
   async function initCamera() {
     try {
@@ -167,50 +183,24 @@
       });
       camEl.srcObject = cameraStream;
       await new Promise((r) => { camEl.onloadedmetadata = r; });
-
-      // 既に接続中の観客へ offer を送る
-      // （担ぎ手がカメラ起動前に観客が join している場合への対応）
-      // ← サーバーから「viewer_request」が来たときに対処済みだが
-      //   カメラ起動後に再通知してもらうよう join_mikoshi を再送は不要
-      //   → 代わりに viewer_request を送り返してもらうためにサーバーで対処済み
-    } catch (e) { console.warn('camera:', e); }
+    } catch (e) { console.warn('[camera]', e); }
   }
 
   function analyzeFrame() {
+    if (!camEl.videoWidth) return;
     anvCtx.drawImage(camEl, 0, 0, 80, 60);
     const px = anvCtx.getImageData(0, 0, 80, 60).data;
     const n  = px.length / 4;
     let lum = 0, white = 0, rSum = 0, bSum = 0;
     for (let i = 0; i < px.length; i += 4) {
       const r = px[i], g = px[i+1], b = px[i+2];
-      lum   += 0.2126*r + 0.7152*g + 0.0722*b;
+      lum  += 0.2126*r + 0.7152*g + 0.0722*b;
       if (r > 200 && g > 200 && b > 200) white++;
       rSum += r; bSum += b;
     }
-    S.brightness = lerp(S.brightness, lum / (n * 255),     0.07);
-    S.whiteRatio = lerp(S.whiteRatio, white / n,            0.07);
-    S.colorTemp  = lerp(S.colorTemp,  rSum/(rSum+bSum+1),  0.05);
-  }
-
-  // ============================================================
-  //  マイク
-  // ============================================================
-  let micAnalyser = null, micBuf = null;
-  async function initMic() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      const ac = new (window.AudioContext || window.webkitAudioContext)();
-      micAnalyser = ac.createAnalyser();
-      micAnalyser.fftSize = 256;
-      ac.createMediaStreamSource(stream).connect(micAnalyser);
-      micBuf = new Uint8Array(micAnalyser.frequencyBinCount);
-    } catch (e) { console.warn('mic:', e); }
-  }
-
-  function analyzeMic() {
-    if (!micAnalyser) return;
-    micAnalyser.getByteFrequencyData(micBuf);
-    S.mic = lerp(S.mic, micBuf.reduce((s,v)=>s+v,0)/(micBuf.length*255)*4, 0.1);
+    S.brightness = lerp(S.brightness, lum / (n * 255),    0.07);
+    S.whiteRatio = lerp(S.whiteRatio, white / n,           0.07);
+    S.colorTemp  = lerp(S.colorTemp,  rSum/(rSum+bSum+1), 0.05);
   }
 
   // ============================================================
@@ -228,10 +218,10 @@
     window.addEventListener('devicemotion', (e) => {
       const g = e.accelerationIncludingGravity;
       if (!g) return;
-      const { x=0, y=0, z=0 } = g;
-      const rel = Math.max(Math.sqrt(x*x+y*y+z*z) - 9.8, 0);
-      S.accX  = x/10; S.accY = y/10;
-      S.accMag = lerp(S.accMag, Math.min(rel/8, 1), 0.15);
+      const { x = 0, y = 0, z = 0 } = g;
+      const rel = Math.max(Math.sqrt(x*x + y*y + z*z) - 9.8, 0);
+      S.accX   = x / 10; S.accY = y / 10;
+      S.accMag = lerp(S.accMag, Math.min(rel / 8, 1), 0.15);
       const now = performance.now();
       if (rel > 2.0 && prevMag <= rel && now - lastPeak > 250) {
         lastPeak = now;
@@ -242,144 +232,411 @@
   }
 
   // ============================================================
-  //  音響エンジン ── お囃子 + 大自然の複雑性
-  //
-  //  Layer 1: 太鼓 (MembraneSynth)  担ぎリズムに連動
-  //  Layer 2: 鉦・鈴 (MetalSynth)   4打ちに1回 + 散発
-  //  Layer 3: 笛 (サイン+ブレスノイズ) 明るさ・色温で漂う
-  //  Layer 4: 環境テクスチャ (ピンクノイズ)
-  //  Layer 5: 低域ドローン (三角波)  担ぎ手ごとに異なる基音
-  //
-  //  音階: 四七抜き短音階 (D E G A C)
+  //  Pillar 1: グラニュラーエンジン
+  //  マイクの環境音を 600ms ずつ録音→粒子再生 → WebRTC 音声トラックへ
   // ============================================================
-  const YO = ['D2','E2','G2','A2','C3','D3','E3','G3','A3','C4',
-              'D4','E4','G4','A4','C5','D5','E5','G5'];
-  const OFFSETS = [0,2,4,7,9,12,14,16];
-  let audio = {};
+  class GranularEngine {
+    constructor(ctx, outputNode) {
+      this.ctx     = ctx;
+      this.output  = outputNode;
+      this.buffers = [];
+      this.maxBufs = 6;
+      this.running = false;
+      this.pitch   = 1.0;    // センサーで変調
+      this.spread  = 0.7;    // ステレオ広がり
+      this.density = 85;     // ms/grain
+    }
 
+    start(micStream) {
+      this.running = true;
+      this._captureLoop(micStream);
+      this._grainLoop();
+    }
+
+    stop() { this.running = false; }
+
+    _captureLoop(stream) {
+      const doCapture = () => {
+        if (!this.running) return;
+        let mimeType = '';
+        for (const m of ['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','']) {
+          if (!m || MediaRecorder.isTypeSupported(m)) { mimeType = m; break; }
+        }
+        try {
+          const opts = mimeType ? { mimeType } : {};
+          const mr   = new MediaRecorder(stream, opts);
+          const chunks = [];
+          mr.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+          mr.onstop = async () => {
+            try {
+              const blob    = new Blob(chunks, { type: mr.mimeType || 'audio/webm' });
+              const ab      = await blob.arrayBuffer();
+              const decoded = await this.ctx.decodeAudioData(ab.slice(0));
+              if (decoded && decoded.duration > 0.04) {
+                this.buffers.push(decoded);
+                if (this.buffers.length > this.maxBufs) this.buffers.shift();
+              }
+            } catch (_) {}
+            if (this.running) setTimeout(doCapture, 50);
+          };
+          mr.start();
+          setTimeout(() => { try { if (mr.state === 'recording') mr.stop(); } catch (_) {} }, 600);
+        } catch (e) {
+          console.warn('[granular] capture:', e);
+          setTimeout(() => { if (this.running) doCapture(); }, 1200);
+        }
+      };
+      doCapture();
+    }
+
+    _playGrain() {
+      if (!this.buffers.length) return;
+      const buf = this.buffers[Math.floor(Math.random() * this.buffers.length)];
+      if (!buf || buf.duration < 0.04) return;
+
+      const dur      = 0.055 + Math.random() * 0.13;  // 55–185 ms
+      const startPos = Math.random() * Math.max(0.001, buf.duration - dur);
+      const now      = this.ctx.currentTime;
+
+      const src = this.ctx.createBufferSource();
+      src.buffer           = buf;
+      src.playbackRate.value = this.pitch * (0.83 + Math.random() * 0.34);
+
+      // Hanning ウィンドウエンベロープ
+      const env = this.ctx.createGain();
+      env.gain.setValueAtTime(0, now);
+      env.gain.linearRampToValueAtTime(0.42, now + dur * 0.15);
+      env.gain.setValueAtTime(0.42, now + dur * 0.85);
+      env.gain.linearRampToValueAtTime(0, now + dur);
+
+      const pan = this.ctx.createStereoPanner();
+      pan.pan.value = (Math.random() - 0.5) * this.spread;
+
+      src.connect(env);
+      env.connect(pan);
+      pan.connect(this.output);
+      src.start(now, startPos, dur + 0.01);
+    }
+
+    _grainLoop() {
+      const tick = () => {
+        if (!this.running) return;
+        this._playGrain();
+        setTimeout(tick, this.density * (0.5 + Math.random() * 1.0));
+      };
+      tick();
+    }
+  }
+
+  // ============================================================
+  //  Pillar 3: ピュア Web Audio API お囃子楽器
+  // ============================================================
+
+  // 合成インパルスレスポンスによるコンボリューションリバーブ
+  function createConvReverb(ctx, duration, decay) {
+    const sr  = ctx.sampleRate;
+    const len = Math.floor(sr * duration);
+    const ir  = ctx.createBuffer(2, len, sr);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = ir.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        d[i] = (Math.random() * 2 - 1) * Math.exp(-(i / sr) / (decay * 0.38));
+      }
+    }
+    const conv = ctx.createConvolver();
+    conv.buffer = ir;
+    return conv;
+  }
+
+  // 太鼓 ─ ノイズ帯域通過 + サインピッチ感
+  function hitTaiko(ctx, output, baseFreq, vel) {
+    const now = ctx.currentTime;
+    const sr  = ctx.sampleRate;
+
+    // 胴鳴り（低域バンドパスノイズ）
+    const bodyBuf = ctx.createBuffer(1, Math.floor(sr * 0.9), sr);
+    const bd = bodyBuf.getChannelData(0);
+    for (let i = 0; i < bd.length; i++) bd[i] = Math.random() * 2 - 1;
+    const bodyNoise = ctx.createBufferSource();
+    bodyNoise.buffer = bodyBuf;
+    const bodyFilt  = ctx.createBiquadFilter();
+    bodyFilt.type   = 'bandpass';
+    bodyFilt.frequency.value = baseFreq * 0.75;
+    bodyFilt.Q.value = 2.2;
+    const bodyGain = ctx.createGain();
+    bodyGain.gain.setValueAtTime(vel * 1.7, now);
+    bodyGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.65);
+    bodyNoise.connect(bodyFilt); bodyFilt.connect(bodyGain); bodyGain.connect(output);
+    bodyNoise.start(now); bodyNoise.stop(now + 0.7);
+
+    // 打面アタック（高域短ノイズ）
+    const skinBuf = ctx.createBuffer(1, Math.floor(sr * 0.06), sr);
+    const sd = skinBuf.getChannelData(0);
+    for (let i = 0; i < sd.length; i++) sd[i] = Math.random() * 2 - 1;
+    const skinNoise = ctx.createBufferSource();
+    skinNoise.buffer = skinBuf;
+    const skinFilt  = ctx.createBiquadFilter();
+    skinFilt.type   = 'bandpass';
+    skinFilt.frequency.value = baseFreq * 5.5;
+    skinFilt.Q.value = 0.9;
+    const skinGain = ctx.createGain();
+    skinGain.gain.setValueAtTime(vel * 0.9, now);
+    skinGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.045);
+    skinNoise.connect(skinFilt); skinFilt.connect(skinGain); skinGain.connect(output);
+    skinNoise.start(now); skinNoise.stop(now + 0.065);
+
+    // ピッチサイン（余韻感）
+    const toneOsc = ctx.createOscillator();
+    toneOsc.type = 'sine';
+    toneOsc.frequency.setValueAtTime(baseFreq * 1.4, now);
+    toneOsc.frequency.exponentialRampToValueAtTime(baseFreq * 0.55, now + 0.28);
+    const toneGain = ctx.createGain();
+    toneGain.gain.setValueAtTime(vel * 0.45, now);
+    toneGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+    toneOsc.connect(toneGain); toneGain.connect(output);
+    toneOsc.start(now); toneOsc.stop(now + 0.35);
+  }
+
+  // 鉦 ─ 非調和倍音（金属感）
+  function hitKane(ctx, output, baseFreq) {
+    const now    = ctx.currentTime;
+    const ratios = [1, 2.76, 5.40, 8.93];
+    const amps   = [1.0, 0.55, 0.28, 0.14];
+    const decays = [2.5, 1.8, 1.2, 0.8];
+    ratios.forEach((r, i) => {
+      const osc = ctx.createOscillator();
+      osc.type  = 'sine';
+      osc.frequency.value = baseFreq * r;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(amps[i] * 0.32, now);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + decays[i]);
+      osc.connect(g); g.connect(output);
+      osc.start(now); osc.stop(now + decays[i] + 0.08);
+    });
+  }
+
+  // 笛 ─ ブレスノイズ + ビブラート付きサイン
+  function createFue(ctx, output) {
+    const sr  = ctx.sampleRate;
+    const len = Math.floor(sr * 4);
+    const nBuf = ctx.createBuffer(1, len, sr);
+    const nd   = nBuf.getChannelData(0);
+    for (let i = 0; i < len; i++) nd[i] = Math.random() * 2 - 1;
+
+    const noiseNode  = ctx.createBufferSource();
+    noiseNode.buffer = nBuf; noiseNode.loop = true;
+    const breathFilt = ctx.createBiquadFilter();
+    breathFilt.type  = 'bandpass';
+    breathFilt.frequency.value = 1400;
+    breathFilt.Q.value = 3.5;
+    const breathGain = ctx.createGain();
+    breathGain.gain.value = 0.10;
+    noiseNode.connect(breathFilt); breathFilt.connect(breathGain); breathGain.connect(output);
+    noiseNode.start();
+
+    const fueOsc = ctx.createOscillator();
+    fueOsc.type  = 'sine';
+    fueOsc.frequency.value = 523.25;  // C5
+
+    const vibLFO   = ctx.createOscillator();
+    vibLFO.type    = 'sine';
+    vibLFO.frequency.value = 5.2;
+    const vibGain  = ctx.createGain();
+    vibGain.gain.value = 7;
+    vibLFO.connect(vibGain); vibGain.connect(fueOsc.frequency);
+
+    const fueGain  = ctx.createGain();
+    fueGain.gain.value = 0.20;
+    fueOsc.connect(fueGain); fueGain.connect(output);
+    fueOsc.start(); vibLFO.start();
+
+    return { breathFilt, breathGain, fueOsc, vibGain, fueGain };
+  }
+
+  // ============================================================
+  //  メイン音響初期化（ユーザータップ後に呼ばれる）
+  // ============================================================
   async function initAudio() {
-    await Tone.start();
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-    const master = new Tone.Gain(0.9).toDestination();
-    const reverb = new Tone.Reverb({ decay: 5, wet: 0.45 }).connect(master);
-    await reverb.ready;
-    const delay  = new Tone.FeedbackDelay({ delayTime: 0.18, feedback: 0.20, wet: 0.12 }).connect(reverb);
-    const comp   = new Tone.Compressor(-16, 4).connect(delay);
+    // ─── ルーティング ───
+    //   instrBus → dry → comp → master → destination
+    //   instrBus → rvSend → convRev → master
+    const master = audioCtx.createGain();
+    master.gain.value = 0.82;
+    master.connect(audioCtx.destination);
 
-    // 太鼓
-    const taiko = new Tone.MembraneSynth({
-      pitchDecay: 0.10, octaves: 5,
-      oscillator: { type: 'sine' },
-      envelope: { attack: 0.001, decay: 0.8, sustain: 0, release: 0.4 },
-      volume: 0,
-    }).connect(comp);
+    const comp = audioCtx.createDynamicsCompressor();
+    comp.threshold.value = -12; comp.knee.value = 6;
+    comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.15;
+    comp.connect(master);
 
-    const kotsuzumi = new Tone.MembraneSynth({
-      pitchDecay: 0.05, octaves: 3,
-      oscillator: { type: 'triangle' },
-      envelope: { attack: 0.001, decay: 0.35, sustain: 0, release: 0.15 },
-      volume: -8,
-    }).connect(comp);
+    const convRev = createConvReverb(audioCtx, 3.5, 2.6);
+    convRev.connect(master);
 
-    // 鉦・鈴
-    const kane = new Tone.MetalSynth({
-      frequency: 400, harmonicity: 5.1, modulationIndex: 32,
-      resonance: 3200, octaves: 1.5,
-      envelope: { attack: 0.001, decay: 1.0, release: 0.2 },
-      volume: -6,
-    }).connect(reverb);
+    const instrBus = audioCtx.createGain(); instrBus.gain.value = 1.0;
+    instrBus.connect(comp);               // ドライ
 
-    const suzu = new Tone.MetalSynth({
-      frequency: 1200, harmonicity: 3.1, modulationIndex: 16,
-      resonance: 5000, octaves: 0.8,
-      envelope: { attack: 0.001, decay: 0.22, release: 0.05 },
-      volume: -14,
-    }).connect(reverb);
+    const rvSend = audioCtx.createGain(); rvSend.gain.value = 0.45;
+    instrBus.connect(rvSend);
+    rvSend.connect(convRev);             // ウェット
+
+    // ─── Pillar 2: グラニュラー → WebRTC 専用デスティネーション ───
+    granularDest = audioCtx.createMediaStreamDestination();
+    const granBus = audioCtx.createGain(); granBus.gain.value = 0.80;
+    granBus.connect(granularDest);
+    // 担ぎ手ローカルにはグラニュラーは流さない（エコー防止）
+
+    // ─── マイク ───
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl:  false,
+        },
+        video: false,
+      });
+      micAnalyser = audioCtx.createAnalyser();
+      micAnalyser.fftSize = 256;
+      audioCtx.createMediaStreamSource(micStream).connect(micAnalyser);
+      micBuf = new Uint8Array(micAnalyser.frequencyBinCount);
+
+      // Pillar 1: グラニュラーエンジン起動
+      granEngine = new GranularEngine(audioCtx, granBus);
+      granEngine.start(micStream);
+    } catch (e) {
+      console.warn('[audio] マイク取得失敗:', e);
+    }
+
+    // ─── 担ぎ手ごとの基音 ───
+    const baseIdx   = Math.min(voiceIndex * 3, YO.length - 1);
+    const taikoFreq = YO[Math.max(0, baseIdx - 5)] || 110;
+    const kaneFreq  = YO[Math.min(baseIdx + 2, YO.length - 1)] || 220;
+
+    // 起動一打
+    setTimeout(() => hitTaiko(audioCtx, instrBus, taikoFreq, 0.55), 300);
+    setTimeout(() => hitKane(audioCtx, instrBus, kaneFreq),          750);
 
     // 笛
-    const fueOsc = new Tone.OmniOscillator({ type: 'sine', frequency: 'G4', volume: -10 }).connect(comp);
-    const fueVib = new Tone.LFO({ frequency: 5.2, min: -5, max: 5 });
-    fueVib.connect(fueOsc.frequency); fueVib.start();
-    const breathFilt = new Tone.Filter({ type: 'bandpass', frequency: 1800, Q: 3 }).connect(comp);
-    const breathNoise = new Tone.Noise('white');
-    breathNoise.volume.value = -26;
-    breathNoise.connect(breathFilt);
-    breathNoise.start(); fueOsc.start();
+    fueObj = createFue(audioCtx, instrBus);
 
-    // 環境テクスチャ
-    const envFilt1 = new Tone.Filter({ type: 'bandpass', frequency: 500,  Q: 0.8 }).connect(reverb);
-    const envFilt2 = new Tone.Filter({ type: 'bandpass', frequency: 2200, Q: 1.5 }).connect(reverb);
-    const envNoise = new Tone.Noise('pink');
-    envNoise.volume.value = -22;
-    envNoise.connect(envFilt1); envNoise.connect(envFilt2); envNoise.start();
+    // 環境ドローン（低域三角波）
+    const droneOsc = audioCtx.createOscillator();
+    droneOsc.type  = 'triangle';
+    droneOsc.frequency.value = taikoFreq * 0.5;
+    const droneGain = audioCtx.createGain(); droneGain.gain.value = 0.13;
+    droneOsc.connect(droneGain); droneGain.connect(rvSend);
+    droneOsc.start();
 
-    // ドローン
-    const baseNote  = YO[OFFSETS[voiceIndex % OFFSETS.length]];
-    const droneFreq = Tone.Frequency(baseNote).toFrequency();
-    const drone = new Tone.OmniOscillator({ type: 'triangle', frequency: droneFreq, volume: -16 }).connect(reverb);
-    drone.start();
+    // 環境ノイズテクスチャ
+    const envBuf = audioCtx.createBuffer(1, audioCtx.sampleRate * 4, audioCtx.sampleRate);
+    const ed = envBuf.getChannelData(0);
+    for (let i = 0; i < ed.length; i++) ed[i] = Math.random() * 2 - 1;
+    const envSrc = audioCtx.createBufferSource();
+    envSrc.buffer = envBuf; envSrc.loop = true;
+    const envFilt = audioCtx.createBiquadFilter();
+    envFilt.type  = 'bandpass'; envFilt.frequency.value = 500; envFilt.Q.value = 0.9;
+    const envGain = audioCtx.createGain(); envGain.gain.value = 0.055;
+    envSrc.connect(envFilt); envFilt.connect(envGain); envGain.connect(rvSend);
+    envSrc.start();
 
-    // 起動確認（最初の一打）
-    setTimeout(() => {
-      taiko.triggerAttackRelease(baseNote, '8n', Tone.now(), 0.5);
-      setTimeout(() => kane.triggerAttackRelease(Tone.now(), 0.6), 320);
-    }, 300);
+    _audioRefs = {
+      instrBus, rvSend, comp, master, convRev,
+      envFilt, envGain, droneGain, droneOsc,
+    };
 
-    // リズムエンジン
+    // ─── リズムトリガー（加速度ピーク） ───
     let kaneCount = 0;
     onPeak((rel) => {
-      const vel     = Math.min(rel / 5, 1);
-      const ni      = Math.min(OFFSETS[voiceIndex%OFFSETS.length] + Math.floor(S.brightness*3), YO.length-1);
-      taiko.triggerAttackRelease(YO[ni], '8n', Tone.now(), 0.45 + vel * 0.5);
-      kotsuzumi.triggerAttackRelease(YO[Math.min(ni+4,YO.length-1)], '16n', Tone.now()+0.07, 0.25+vel*0.3);
+      const vel = Math.min(rel / 5, 1);
+      const ni  = Math.max(0, Math.min(baseIdx + Math.floor(S.brightness * 4), YO.length - 1));
+      hitTaiko(audioCtx, instrBus, YO[Math.max(0, ni - 4)], 0.40 + vel * 0.55);
       if (++kaneCount % 4 === 0) {
-        kane.frequency.value = 200 + S.colorTemp * 600;
-        kane.triggerAttackRelease(Tone.now()+0.03, 0.55);
+        hitKane(audioCtx, instrBus, kaneFreq * (1 + S.colorTemp * 0.8));
       }
-      if (Math.random() < 0.4) {
-        suzu.frequency.value = 800 + Math.random()*800;
-        suzu.triggerAttackRelease(Tone.now()+0.05*Math.random(), 0.3+Math.random()*0.4);
+      if (Math.random() < 0.32) {
+        hitKane(audioCtx, instrBus, 650 + Math.random() * 750);
       }
     });
 
-    // 笛フレーズ自動進行
-    let fueIdx = 4 + OFFSETS[voiceIndex % OFFSETS.length];
+    // ─── 笛フレーズ自動進行 ───
+    let fueFreqIdx = Math.min(8 + baseIdx, YO.length - 3);
     function advanceFue() {
-      if (Math.random() < 0.3 + S.accMag * 0.65) {
-        fueIdx += (Math.random()<0.6?1:-1) * (Math.random()<0.7?1:2);
-        fueIdx = Math.max(2, Math.min(YO.length-1, fueIdx));
+      if (Math.random() < 0.45 + S.accMag * 0.45) {
+        fueFreqIdx += (Math.random() < 0.6 ? 1 : -1) * (Math.random() < 0.72 ? 1 : 2);
+        fueFreqIdx  = Math.max(6, Math.min(YO.length - 1, fueFreqIdx));
       }
-      const idx = Math.max(0, Math.min(YO.length-1, fueIdx + Math.round((1-S.colorTemp)*3)));
-      fueOsc.frequency.rampTo(Tone.Frequency(YO[idx]).toFrequency(), 0.35 + Math.random()*0.5);
-      breathFilt.frequency.rampTo(Tone.Frequency(YO[idx]).toFrequency() * 2.2, 0.2);
-      setTimeout(advanceFue, (0.7 + Math.random()*1.6) / (0.5 + S.accMag*1.5) * 1000);
+      const freq = YO[fueFreqIdx];
+      if (fueObj && audioCtx) {
+        const t = audioCtx.currentTime;
+        fueObj.fueOsc.frequency.linearRampToValueAtTime(freq, t + 0.38);
+        fueObj.breathFilt.frequency.linearRampToValueAtTime(freq * 2.2, t + 0.22);
+      }
+      const ms = Math.max(300, (0.8 + Math.random() * 1.8) / (0.5 + S.accMag * 1.5) * 1000);
+      setTimeout(advanceFue, ms);
     }
     advanceFue();
-
-    audio = { taiko, kotsuzumi, kane, suzu, fueOsc, breathFilt, breathNoise,
-              envNoise, envFilt1, envFilt2, drone, reverb, delay, comp, master };
 
     updateLoop();
   }
 
+  // ============================================================
+  //  マイク解析
+  // ============================================================
+  function analyzeMic() {
+    if (!micAnalyser) return;
+    micAnalyser.getByteFrequencyData(micBuf);
+    const avg = micBuf.reduce((s, v) => s + v, 0) / (micBuf.length * 255);
+    S.mic = lerp(S.mic, avg * 4, 0.1);
+  }
+
+  // ============================================================
+  //  毎フレーム更新ループ
+  // ============================================================
   function updateLoop() {
     requestAnimationFrame(updateLoop);
-    if (!audio.reverb) return;
-    analyzeFrame(); analyzeMic();
-    audio.envFilt1.frequency.rampTo(150 + S.mic*700, 0.3);
-    audio.envFilt2.frequency.rampTo(1000 + S.brightness*3500, 0.4);
-    audio.envNoise.volume.rampTo(-28 + S.mic*10, 0.3);
-    audio.breathNoise.volume.rampTo(-30 + S.accMag*14, 0.2);
-    audio.drone.detune.rampTo((S.colorTemp - 0.5)*25, 1.5);
-    audio.reverb.wet.rampTo(0.3 + Math.min(audienceCount/20,1)*0.5, 2);
+    if (!_audioRefs || !audioCtx) return;
+
+    analyzeFrame();
+    analyzeMic();
+
+    const t = audioCtx.currentTime;
+    const a = _audioRefs;
+
+    // グラニュラー変調
+    if (granEngine) {
+      granEngine.density = 35 + (1 - Math.min(S.mic, 1)) * 90;
+      granEngine.pitch   = 0.88 + S.colorTemp * 0.28;
+      granEngine.spread  = 0.5 + S.accMag * 0.5;
+    }
+
+    // 環境フィルター
+    a.envFilt.frequency.linearRampToValueAtTime(180 + S.mic * 650, t + 0.3);
+    a.envGain.gain.linearRampToValueAtTime(0.03 + S.mic * 0.11, t + 0.3);
+
+    // 笛ブレス・ビブラート
+    if (fueObj) {
+      fueObj.breathGain.gain.linearRampToValueAtTime(0.05 + S.accMag * 0.18, t + 0.2);
+      fueObj.vibGain.gain.linearRampToValueAtTime(4 + S.accMag * 13, t + 0.3);
+    }
+
+    // リバーブウェット（観客が多いほど豊か）
+    a.rvSend.gain.linearRampToValueAtTime(
+      0.3 + Math.min(audienceCount / 20, 1) * 0.45, t + 2
+    );
   }
 
   function applyWorldToAudio(s) {
-    if (!audio.reverb) return;
-    audio.reverb.wet.rampTo(0.3 + Math.min(s.audienceCount/20,1)*0.5, 2);
+    if (!_audioRefs || !audioCtx) return;
+    audienceCount = s.audienceCount;
+    _audioRefs.rvSend.gain.linearRampToValueAtTime(
+      0.3 + Math.min(s.audienceCount / 20, 1) * 0.45,
+      audioCtx.currentTime + 2
+    );
   }
 
-  function lerp(a, b, t) { return a + (b-a)*t; }
+  function lerp(a, b, t) { return a + (b - a) * t; }
   </script>
 </body>
 </html>
