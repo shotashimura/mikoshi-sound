@@ -97,19 +97,31 @@
   };
 
   // ─── SONGS: 4 曲を 3:30 ごとに循環 (Oasis アンセム集) ───
+  // 各曲は明確に違う音色になるよう tone(LPF Hz) / presence(EQ dB) / drumFeel を持つ。
+  //   tone:     2200=暗い・厚い ↔ 4200=明るい・抜ける
+  //   presence: 1=スムース ↔ 7=噛みつく
+  //   drive:    18=クリーンクランチ ↔ 50=ファズ
+  //   drumFeel: 'standard' / 'driving' / 'half' / 'anthemic'
   const SONGS = [
-    { name: 'Wonderwall',     progression: ['G','D','Em','Cadd9'], tonic: 49.00, bpmBase:  87, drive: 28 },
-    { name: 'Live Forever',   progression: ['G','D','Am','C'],     tonic: 49.00, bpmBase: 110, drive: 35 },
-    { name: 'Anger',          progression: ['C','G','Am','F'],     tonic: 65.41, bpmBase:  82, drive: 22 },
-    { name: 'RocknRoll Star', progression: ['G','F','G','F'],      tonic: 49.00, bpmBase: 120, drive: 45 },
+    { name: 'Wonderwall',     progression: ['G','D','Em','Cadd9'], tonic: 49.00, bpmBase:  87,
+      drive: 24, tone: 2700, presence: 3, drumFeel: 'standard' },
+    { name: 'Live Forever',   progression: ['G','D','Am','C'],     tonic: 49.00, bpmBase: 110,
+      drive: 36, tone: 3500, presence: 6, drumFeel: 'anthemic' },
+    { name: 'Anger',          progression: ['C','G','Am','F'],     tonic: 65.41, bpmBase:  78,
+      drive: 18, tone: 2200, presence: 1, drumFeel: 'half' },
+    { name: 'RocknRoll Star', progression: ['G','F','G','F'],      tonic: 49.00, bpmBase: 122,
+      drive: 48, tone: 4200, presence: 7, drumFeel: 'driving' },
   ];
-  const SONG_DURATION_MS = 210000;   // 3:30 per song
+  const SONG_DURATION_MS = 210000;
 
   // ─── 現在再生中の曲の状態 (サーバー指揮、socket 'song_change' で更新) ───
   let _activeSongIdx     = 0;
   let _activeProgression = SONGS[0].progression;
   let _activeBpmBase     = SONGS[0].bpmBase;
   let _activeDrive       = SONGS[0].drive;
+  let _activeTone        = SONGS[0].tone;
+  let _activePresence    = SONGS[0].presence;
+  let _activeDrumFeel    = SONGS[0].drumFeel;
   // 音声初期化前にサーバーから届いた曲番号を保留しておく
   let _pendingSongIdx    = 0;
 
@@ -907,23 +919,27 @@
   // 曲切替時に measureN をリセットして新曲の頭(コード1)から始めるためのフラグ
   let _songJustChanged = false;
 
-  // ─── 曲切替: 進行 / BPM / 歪み量 / サブベースのトニックを更新 ───
+  // ─── 曲切替: 進行 / BPM / 歪み量 / 音色 / ドローンを更新 ───
   function applySong(idx) {
     const song = SONGS[idx];
     _activeSongIdx     = idx;
     _activeProgression = song.progression;
     _activeBpmBase     = song.bpmBase;
     _activeDrive       = song.drive;
+    _activeTone        = song.tone;
+    _activePresence    = song.presence;
+    _activeDrumFeel    = song.drumFeel;
     _songJustChanged   = true;
 
     if (audioCtx && _audioRefs?.guitarAmps) {
-      // 3チャンネルそれぞれに ±5 のずれた歪みカーブを再生成
+      const t = audioCtx.currentTime;
       const offs = [-5, 0, -5];
       _audioRefs.guitarAmps.forEach((amp, i) => {
         amp.dist.curve = makeDistortionCurve(song.drive + offs[i]);
+        amp.tone.frequency.linearRampToValueAtTime(song.tone,     t + 0.6);
+        amp.pres.gain.linearRampToValueAtTime(song.presence,      t + 0.6);
       });
     }
-    // サブベースドローンを新曲のトニックに ramp
     if (audioCtx && _audioRefs?.droneOsc) {
       _audioRefs.droneOsc.frequency.linearRampToValueAtTime(
         song.tonic, audioCtx.currentTime + 1.2
@@ -938,11 +954,23 @@
     function nextTick() {
       if (!audioCtx) return;
 
-      // 曲が直前に切り替わった場合は新曲のコード1から始める + クラッシュで合図
+      // 曲が直前に切り替わった場合: タムフィル → クラッシュ → 1小節のブレイク
+      // この "間" をはさんで新曲を頭から勢いよく始める
       if (_songJustChanged) {
         _songJustChanged = false;
         measureN = 0;
-        hitCrash(audioCtx, drumBus, 0.7);
+        // タムフィル(高 → 低、ロール)
+        const tomFs = [240, 200, 160, 120];
+        tomFs.forEach((f, i) => {
+          setTimeout(() => hitTom(audioCtx, drumBus, f, 0.85), i * 70);
+        });
+        // クラッシュ大
+        setTimeout(() => hitCrash(audioCtx, drumBus, 0.95), 280);
+        // 1小節空けて nextTick へ (ブレイク中)
+        const newBpm = _activeBpmBase;
+        const newMeasureMs = 60000 / newBpm * 4;
+        setTimeout(nextTick, newMeasureMs | 0);
+        return;
       }
 
       const conf = tempoDetector.effectiveConfidence();
@@ -961,24 +989,62 @@
       measureN++;
 
       // === 16ステップでドラム・ベース・ギターを組む ===
+      // drumFeel に応じて kick / snare / hihat の置き場所を変える
+      const feel = _activeDrumFeel;
       for (let s = 0; s < 16; s++) {
         const tMs = (sixteenth * s) | 0;
 
-        // ハイハット: 8分音符
-        if (s % 2 === 0) {
-          const hhVel = vel * (s % 4 === 0 ? 0.85 : 0.55);
-          const open  = (s === 14 && Math.random() < 0.30);
-          setTimeout(() => hitHihat(audioCtx, drumBus, hhVel, open), tMs);
+        // ハイハット
+        let hatStep = false, hatVel = 0, hatOpen = false;
+        if (feel === 'driving') {
+          // 16分連打 (走る感じ)
+          hatStep = true;
+          hatVel = vel * (s % 4 === 0 ? 0.85 : 0.40);
+        } else if (feel === 'half') {
+          // 4分のみ (ゆったり)
+          hatStep = (s % 4 === 0);
+          hatVel = vel * 0.55;
+        } else {
+          // standard / anthemic: 8分
+          hatStep = (s % 2 === 0);
+          hatVel = vel * (s % 4 === 0 ? 0.85 : 0.55);
+          hatOpen = (s === 14 && Math.random() < 0.30);
+        }
+        if (hatStep) {
+          setTimeout(() => hitHihat(audioCtx, drumBus, hatVel, hatOpen), tMs);
         }
 
-        // キック: 1拍目, 3拍目, 食い気味の3拍目裏たまに
-        if (s === 0 || s === 8 || (s === 6 && Math.random() < 0.25)) {
+        // キック
+        let kickHere = false;
+        if (feel === 'driving') {
+          // 1/3 + 食いの 3拍目裏 (1.5拍, 2.5拍, 3.67拍)
+          kickHere = s === 0 || s === 6 || s === 8 || (s === 10 && Math.random() < 0.5);
+        } else if (feel === 'half') {
+          // ゆったり: 1拍目と 3拍目裏(後ノリ)
+          kickHere = s === 0 || s === 10;
+        } else {
+          // standard / anthemic
+          kickHere = s === 0 || s === 8 || (s === 6 && Math.random() < 0.25);
+        }
+        if (kickHere) {
           setTimeout(() => { hitKick(audioCtx, drumBus, vel * 1.0); duckSidechain(); }, tMs);
         }
 
-        // スネア: 2拍目, 4拍目 (バックビート)
-        if (s === 4 || s === 12) {
+        // スネア
+        let snareHere = false;
+        if (feel === 'half') {
+          // 3拍目のみ (ハーフタイム)
+          snareHere = s === 8;
+        } else {
+          // 2/4 拍 (バックビート)
+          snareHere = s === 4 || s === 12;
+        }
+        if (snareHere) {
           setTimeout(() => hitSnare(audioCtx, drumBus, vel * 0.85), tMs);
+        }
+        // anthemic: ゴーストスネア (s=10, 14 にうっすら)
+        if (feel === 'anthemic' && (s === 10 || s === 14) && Math.random() < 0.30) {
+          setTimeout(() => hitSnare(audioCtx, drumBus, vel * 0.30), tMs);
         }
 
         // ベース: 8分刻み、コードの bassNotes を順に歩く
@@ -1282,9 +1348,9 @@
     a.envFilt.frequency.linearRampToValueAtTime(400 + S.brightness * 1200, t + 0.3);
     a.envGain.gain.linearRampToValueAtTime(0.018 + S.mic * 0.04, t + 0.3);
 
-    // ギタートーン (3チャンネルすべて): 動きが大きいほど高域開く (ワウ感)
+    // ギタートーン: 曲の base (_activeTone) を中心に accMag で揺らす
     if (a.guitarAmps) {
-      const tf = 2200 + S.accMag * 2400;
+      const tf = _activeTone + S.accMag * 1200;
       a.guitarAmps.forEach(amp => amp.tone.frequency.linearRampToValueAtTime(tf, t + 0.25));
     }
 

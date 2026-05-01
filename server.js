@@ -13,10 +13,15 @@ const io     = new Server(server, {
 });
 
 // SharedArrayBuffer を使うには Cross-Origin Isolation が必要
-// COOP + COEP ヘッダーをすべてのレスポンスに付与する
+// COOP + COEP ヘッダーをすべてのレスポンスに付与する。
+// HTML は no-store (曲同期コードのアップデートを即時反映させるため)。
 app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Opener-Policy',   'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  if (req.path === '/' || req.path === '/mikoshi' || req.path === '/audience'
+      || req.path.endsWith('.html')) {
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+  }
   next();
 });
 
@@ -46,24 +51,34 @@ const state = {
   audienceEnergy:  new Map(),  // socketId → 群衆エネルギー (0-1)
   voiceIndex: 0,
 
-  // ── 曲の同期: サーバーが指揮 ──
-  // クライアント側の SONGS は現状 4曲。SONG_COUNT を超えた場合は client 側で modulo する。
-  currentSongIdx:   0,
-  songStartTs:      Date.now(),
 };
 
+// ─── 曲同期: 壁時計ベース ───
+// songIdx を Date.now() から決定論的に算出するので、サーバー再起動・複数
+// インスタンス・コールドスタートに強い。全クライアントが同じ計算をしても
+// 同じ値になる(ただし同期は server 経由で確実にする)。
 const SONG_COUNT       = 4;
 const SONG_DURATION_MS = 210000;   // 3:30 per song
 
+function computeSongIdx() {
+  return Math.floor(Date.now() / SONG_DURATION_MS) % SONG_COUNT;
+}
+function computeSongStartTs() {
+  return Math.floor(Date.now() / SONG_DURATION_MS) * SONG_DURATION_MS;
+}
+
+let _lastBroadcastIdx = computeSongIdx();
+console.log(`[song] start at ${_lastBroadcastIdx}`);
+
+// 1秒ごとに songIdx をチェックし、変わった瞬間に全端末へ放送
 setInterval(() => {
-  state.currentSongIdx = (state.currentSongIdx + 1) % SONG_COUNT;
-  state.songStartTs    = Date.now();
-  io.emit('song_change', {
-    songIdx:   state.currentSongIdx,
-    startedAt: state.songStartTs,
-  });
-  console.log(`[song] -> ${state.currentSongIdx}`);
-}, SONG_DURATION_MS);
+  const idx = computeSongIdx();
+  if (idx !== _lastBroadcastIdx) {
+    _lastBroadcastIdx = idx;
+    io.emit('song_change', { songIdx: idx, startedAt: computeSongStartTs() });
+    console.log(`[song] -> ${idx}`);
+  }
+}, 1000);
 
 function computeWorldState() {
   const devices = Array.from(state.mikoshiDevices.values());
@@ -113,10 +128,11 @@ io.on('connection', (socket) => {
   console.log(`[+] ${socket.id}`);
 
   // ── 接続直後に現在の曲を送る (mid-song でもすぐ揃う) ──
+  const startTs = computeSongStartTs();
   socket.emit('song_change', {
-    songIdx:   state.currentSongIdx,
-    startedAt: state.songStartTs,
-    elapsedMs: Date.now() - state.songStartTs,
+    songIdx:   computeSongIdx(),
+    startedAt: startTs,
+    elapsedMs: Date.now() - startTs,
   });
 
   // ── 担ぎ手参加 ──────────────────────────────────────────

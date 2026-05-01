@@ -122,19 +122,22 @@
 
   // ─── SONGS: 4 曲を 3:30 ごとに循環 (Oasis アンセム集) ───
   const SONGS = [
-    { name: 'Wonderwall',     progression: ['G','D','Em','Cadd9'], tonic: 49.00, drive: 25 },
-    { name: 'Live Forever',   progression: ['G','D','Am','C'],     tonic: 49.00, drive: 32 },
-    { name: 'Anger',          progression: ['C','G','Am','F'],     tonic: 65.41, drive: 18 },
-    { name: 'RocknRoll Star', progression: ['G','F','G','F'],      tonic: 49.00, drive: 42 },
+    { name: 'Wonderwall',     progression: ['G','D','Em','Cadd9'], tonic: 49.00,
+      drive: 22, tone: 2700 },
+    { name: 'Live Forever',   progression: ['G','D','Am','C'],     tonic: 49.00,
+      drive: 32, tone: 3500 },
+    { name: 'Anger',          progression: ['C','G','Am','F'],     tonic: 65.41,
+      drive: 16, tone: 2200 },
+    { name: 'RocknRoll Star', progression: ['G','F','G','F'],      tonic: 49.00,
+      drive: 44, tone: 4200 },
   ];
   const SONG_DURATION_MS = 210000;
 
   let _activeSongIdx     = 0;
   let _activeProgression = SONGS[0].progression;
   let _activeDrive       = SONGS[0].drive;
-  // 音声初期化前にサーバーから届いた曲番号を保留
+  let _activeTone        = SONGS[0].tone;
   let _pendingSongIdx    = 0;
-  // initAudio 完了後にセットされる applySong への参照 (socket リスナーから呼ぶ用)
   let _audApplySong      = null;
 
   // ============================================================
@@ -722,20 +725,25 @@
     droneOsc.connect(droneGain); droneGain.connect(bassAmp);
     droneOsc.start();
 
-    // ─── 曲切替: 進行 / 歪み量 / トニックドローン更新 + パッドを頭に戻す ───
+    // ─── 曲切替: 進行 / 歪み量 / 音色 / トニックドローン更新 + 切替合図 ───
     function applySong(idx) {
       const song = SONGS[idx];
       _activeSongIdx     = idx;
       _activeProgression = song.progression;
       _activeDrive       = song.drive;
+      _activeTone        = song.tone;
+      const t = audienceCtx.currentTime;
       const offs = [-3, 0, -3];
       guitarAmps.forEach((amp, i) => {
         amp.dist.curve = makeDistortionCurve(song.drive + offs[i]);
+        amp.tone.frequency.linearRampToValueAtTime(song.tone, t + 0.6);
       });
-      droneOsc.frequency.linearRampToValueAtTime(song.tonic, audienceCtx.currentTime + 1.2);
+      droneOsc.frequency.linearRampToValueAtTime(song.tonic, t + 1.2);
       chordIdx = 0;
       currentChord = CHORDS[song.progression[0]];
       rampPadToChord(currentChord);
+      // 切替の合図に大きめのクラッシュ
+      hitCrash(audienceCtx, drumBus, 0.85);
       console.log('[song]', idx, song.name);
     }
     // socket リスナーから呼べるように参照を公開
