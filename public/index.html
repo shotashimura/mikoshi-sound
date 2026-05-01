@@ -2,102 +2,880 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
   <title>神輿サウンド</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background: #0a0010; color: #e8d5a0;
+    html, body {
+      width: 100%; height: 100%; overflow: hidden; background: #06000d;
       font-family: 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', sans-serif;
-      min-height: 100vh; display: flex; flex-direction: column;
-      align-items: center; justify-content: center; overflow: hidden;
+      color: #e8d5a0;
     }
-    canvas#bg { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
-    .container { position: relative; z-index: 1; text-align: center; padding: 2rem; max-width: 600px; width: 100%; }
-    h1 {
-      font-size: 2.4rem; letter-spacing: 0.4em; margin-bottom: 0.4rem;
-      background: linear-gradient(135deg, #e8d5a0, #ff9a3c, #e8d5a0);
-      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    canvas#fx { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+
+    #tap {
+      position: fixed; inset: 0; z-index: 100;
+      background: radial-gradient(ellipse at center, #180828 0%, #06000d 70%);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 1.4rem;
+      cursor: pointer; -webkit-tap-highlight-color: transparent;
+      transition: opacity 0.8s;
     }
-    .sub { font-size: 0.85rem; letter-spacing: 0.2em; color: #a07840; margin-bottom: 3rem; }
-    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; margin-bottom: 3rem; }
-    .card {
-      background: rgba(255,255,255,0.04); border: 1px solid rgba(255,200,100,0.2);
-      border-radius: 16px; padding: 1.8rem 1rem; text-decoration: none;
-      color: inherit; transition: all 0.3s; display: flex; flex-direction: column;
-      align-items: center; gap: 0.8rem;
+    #tap.gone { opacity: 0; pointer-events: none; }
+    #tap .kanji {
+      font-size: clamp(4rem, 14vw, 7rem);
+      color: rgba(255,220,100,0.9);
+      font-family: serif;
+      letter-spacing: 0.1em;
+      text-shadow: 0 0 40px rgba(255,160,40,0.4);
     }
-    .card:hover { background: rgba(255,200,100,0.08); border-color: rgba(255,200,100,0.5); transform: translateY(-3px); }
-    .card .icon { font-size: 2.4rem; }
-    .card .label { font-size: 0.75rem; letter-spacing: 0.25em; color: #a07840; }
-    .card .title { font-size: 1.1rem; letter-spacing: 0.1em; }
-    .qr-section { margin-top: 1rem; }
-    .qr-label { font-size: 0.8rem; letter-spacing: 0.2em; color: #a07840; margin-bottom: 1rem; }
-    #qr-img { width: 180px; height: 180px; border-radius: 12px; background: #fff; padding: 8px; }
-    .qr-url { font-size: 0.75rem; color: #604820; margin-top: 0.6rem; word-break: break-all; }
-    .status { margin-top: 2.5rem; font-size: 0.8rem; color: #604820; letter-spacing: 0.15em; }
-    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #ff6a00; margin-right: 6px; animation: pulse 2s infinite; }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    #tap .hint {
+      font-size: 0.8rem; color: rgba(255,220,100,0.4);
+      letter-spacing: 0.4em;
+      animation: blink 2.4s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.15} }
+
+    #hud {
+      position: fixed; bottom: 1.2rem; left: 50%;
+      transform: translateX(-50%); z-index: 50;
+      font-size: 0.72rem; letter-spacing: 0.3em; color: rgba(232,213,160,0.55);
+      text-align: center; pointer-events: none;
+    }
+    #hud .count {
+      font-size: 1rem;
+      color: rgba(255,220,100,0.85);
+      letter-spacing: 0.15em;
+    }
+    #song-name {
+      position: fixed; top: 1rem; left: 50%; transform: translateX(-50%);
+      z-index: 50; font-size: 0.7rem; letter-spacing: 0.4em;
+      color: rgba(232,213,160,0.5); pointer-events: none;
+    }
   </style>
 </head>
 <body>
-  <canvas id="bg"></canvas>
-  <div class="container">
-    <h1>神輿サウンド</h1>
-    <p class="sub">MIKOSHI SOUND SYSTEM</p>
-    <div class="cards">
-      <a href="/mikoshi" class="card">
-        <span class="icon">🏮</span>
-        <span class="label">CARRIER</span>
-        <span class="title">担ぎ手</span>
-      </a>
-      <a href="/audience" class="card">
-        <span class="icon">👥</span>
-        <span class="label">AUDIENCE</span>
-        <span class="title">観客</span>
-      </a>
-    </div>
-    <div class="qr-section">
-      <p class="qr-label">— 観客はこのQRコードから参加 —</p>
-      <img id="qr-img" alt="QR Code"/>
-      <p class="qr-url" id="qr-url"></p>
-    </div>
-    <div class="status"><span class="dot"></span><span id="status-text">接続待機中…</span></div>
+  <canvas id="fx"></canvas>
+  <div id="song-name"></div>
+  <div id="hud"><div class="count" id="count">— 接続中 —</div><div id="layers"></div></div>
+
+  <div id="tap">
+    <div class="kanji">神輿</div>
+    <div class="hint">タップして開始</div>
   </div>
+
   <script src="/socket.io/socket.io.js"></script>
   <script>
-    fetch('/api/qr').then(r=>r.json()).then(d=>{
-      document.getElementById('qr-img').src = d.audienceQR;
-      document.getElementById('qr-url').textContent = d.audienceUrl;
-    });
-    const socket = io();
-    socket.on('world_state', (s) => {
-      document.getElementById('status-text').textContent =
-        `担ぎ手: ${s.mikoshiCount}台 | 観客: ${s.audienceCount}台`;
-    });
-    const canvas = document.getElementById('bg');
-    const ctx = canvas.getContext('2d');
-    let w, h;
-    const resize = () => { w = canvas.width = window.innerWidth; h = canvas.height = window.innerHeight; };
-    resize(); window.addEventListener('resize', resize);
-    const particles = Array.from({length:80}, () => ({
-      x: Math.random(), y: Math.random(),
-      vx: (Math.random()-0.5)*0.0002,
-      vy: -(Math.random()*0.0003+0.0001),
-      size: Math.random()*2.5+0.5,
-      alpha: Math.random()*0.6+0.1,
-      hue: Math.random()*30+30,
-    }));
-    (function draw() {
-      ctx.clearRect(0,0,w,h);
-      for (const p of particles) {
-        p.x+=p.vx; p.y+=p.vy;
-        if (p.y<-0.02) { p.y=1.02; p.x=Math.random(); }
-        ctx.beginPath(); ctx.arc(p.x*w,p.y*h,p.size,0,Math.PI*2);
-        ctx.fillStyle=`hsla(${p.hue},80%,70%,${p.alpha})`; ctx.fill();
+  'use strict';
+
+  // ============================================================
+  //  G メジャーコード辞書 (Oasis アンセム仕様)
+  //  voicing(ストローク用) / bassNotes(ベース歩き用) / lead(リード音域)
+  // ============================================================
+  const CHORDS = {
+    G:     { bassNotes: [49.00, 73.42, 98.00, 123.47],   voicing: [196.00, 246.94, 293.66, 392.00, 493.88], lead: [329.63, 392.00, 440.00, 493.88, 587.33, 659.26] },
+    D:     { bassNotes: [73.42, 110.00, 146.83, 184.997], voicing: [146.83, 184.997, 220.00, 293.66, 369.99], lead: [369.99, 440.00, 493.88, 587.33, 659.26, 739.99] },
+    Em:    { bassNotes: [82.41, 123.47, 164.81, 196.00], voicing: [164.81, 196.00, 246.94, 329.63, 392.00], lead: [329.63, 392.00, 440.00, 493.88, 587.33, 659.26] },
+    Cadd9: { bassNotes: [65.41, 98.00, 130.81, 164.81],  voicing: [130.81, 164.81, 196.00, 261.63, 293.66], lead: [329.63, 392.00, 440.00, 493.88, 523.25, 659.26] },
+    Am:    { bassNotes: [55.00, 82.41, 110.00, 130.81],  voicing: [110.00, 130.81, 164.81, 220.00, 261.63], lead: [329.63, 392.00, 440.00, 493.88, 523.25, 659.26] },
+    F:     { bassNotes: [43.65, 65.41, 87.31, 110.00],   voicing: [87.31, 130.81, 174.61, 220.00, 261.63],  lead: [349.23, 440.00, 523.25, 587.33, 659.26, 698.46] },
+    C:     { bassNotes: [65.41, 98.00, 130.81, 164.81],  voicing: [130.81, 164.81, 196.00, 261.63, 329.63], lead: [329.63, 392.00, 440.00, 493.88, 523.25, 659.26] },
+  };
+
+  const SONGS = [
+    { name: 'Wonderwall',     progression: ['G','D','Em','Cadd9'], tonic: 49.00, bpmBase:  87, drive: 24, tone: 2700, presence: 3, drumFeel: 'standard' },
+    { name: 'Live Forever',   progression: ['G','D','Am','C'],     tonic: 49.00, bpmBase: 110, drive: 36, tone: 3500, presence: 6, drumFeel: 'anthemic' },
+    { name: 'Anger',          progression: ['C','G','Am','F'],     tonic: 65.41, bpmBase:  78, drive: 18, tone: 2200, presence: 1, drumFeel: 'half'     },
+    { name: 'RocknRoll Star', progression: ['G','F','G','F'],      tonic: 49.00, bpmBase: 122, drive: 48, tone: 4200, presence: 7, drumFeel: 'driving'  },
+  ];
+
+  // ============================================================
+  //  グローバル状態
+  // ============================================================
+  let audioCtx        = null;
+  let connectedCount  = 1;
+  let serverOffsetMs  = 0;            // serverNow ≈ Date.now() + serverOffsetMs
+  let audioCtxStartWallMs = 0;        // audioCtx.currentTime=0 の壁時計時刻
+
+  let _activeSongIdx     = 0;
+  let _songStartedAtServer = 0;
+  let _scheduledThroughMeasure = -1;
+
+  // 各 tier (人数閾値) の現在ゲイン (0..1, 滑らかに変化させる)
+  // 0: 常時 / 1: 2人〜 / 2: 3人〜 / ... / 7: 8人〜
+  const TIER_THRESHOLD = [1, 2, 3, 4, 5, 6, 7, 8];
+  const tierLevel  = new Array(8).fill(0);
+  const tierTarget = new Array(8).fill(0);
+  tierLevel[0] = 1;  // tier 0 は最初から少しでもならないと聞こえない
+
+  // ビジュアル: kick が鳴ったタイミングを保持して画面を脈動させる
+  let lastKickPulse = 0;
+
+  // ============================================================
+  //  Socket.io
+  // ============================================================
+  const socket = io({ transports: ['websocket'] });
+
+  socket.on('song_change', ({ songIdx, startedAt, serverNow }) => {
+    if (typeof serverNow === 'number') {
+      // 即時オフセット推定 (1 サンプル) — 後で time_sync で精緻化
+      serverOffsetMs = serverNow - Date.now();
+    }
+    _activeSongIdx = ((songIdx % SONGS.length) + SONGS.length) % SONGS.length;
+    _songStartedAtServer = startedAt;
+    _scheduledThroughMeasure = -1;   // スケジューラを再初期化
+
+    document.getElementById('song-name').textContent = SONGS[_activeSongIdx].name;
+    if (_g) applySongTone(_activeSongIdx);   // 既に音響起動済みなら音色も追従
+  });
+
+  socket.on('world_state', ({ connectedCount: c, serverNow }) => {
+    if (typeof serverNow === 'number') {
+      // 軽い補正 (RTT 不明だが片道分のゆらぎは許容)
+      const sample = serverNow - Date.now();
+      serverOffsetMs = serverOffsetMs * 0.85 + sample * 0.15;
+    }
+    connectedCount = Math.max(1, c | 0);
+    updateTierTargets();
+    updateHud();
+  });
+
+  // ============================================================
+  //  時刻同期: Christian's algorithm を 5 秒ごと
+  //  RTT/2 ≈ 片道遅延 と仮定し、最低 RTT のサンプルから offset を更新
+  // ============================================================
+  let bestRtt = Infinity;
+  function syncTime() {
+    if (!socket.connected) return;
+    const t0 = Date.now();
+    socket.emit('time_sync', t0, (serverT) => {
+      const t1 = Date.now();
+      const rtt = t1 - t0;
+      const offset = serverT - (t0 + rtt / 2);
+      if (rtt < bestRtt * 1.5 || rtt < 80) {
+        // 良サンプルは強めに、悪サンプルは弱めに反映
+        const w = rtt < bestRtt ? 0.5 : 0.15;
+        serverOffsetMs = serverOffsetMs * (1 - w) + offset * w;
+        if (rtt < bestRtt) bestRtt = rtt;
       }
-      requestAnimationFrame(draw);
-    })();
+    });
+  }
+  setInterval(syncTime, 5000);
+
+  // ============================================================
+  //  タップで開始 (autoplay policy 対策)
+  // ============================================================
+  document.getElementById('tap').addEventListener('pointerdown', async () => {
+    document.getElementById('tap').classList.add('gone');
+    await initAudio();
+    // サーバーから既に songIdx 受信済みなら startScheduler が即動く
+  }, { once: true });
+
+  // ============================================================
+  //  ユーティリティ: 合成インパルスレスポンス・ディストーションカーブ
+  // ============================================================
+  function createConvReverb(ctx, duration, decay) {
+    const sr  = ctx.sampleRate;
+    const len = Math.floor(sr * duration);
+    const ir  = ctx.createBuffer(2, len, sr);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = ir.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        d[i] = (Math.random() * 2 - 1) * Math.exp(-(i / sr) / (decay * 0.38));
+      }
+    }
+    const conv = ctx.createConvolver();
+    conv.buffer = ir;
+    return conv;
+  }
+
+  function makeDistortionCurve(amount = 50) {
+    const n = 4096;
+    const curve = new Float32Array(n);
+    const k = amount;
+    for (let i = 0; i < n; i++) {
+      const x = (i * 2) / n - 1;
+      curve[i] = ((Math.PI + k) * x) / (Math.PI + k * Math.abs(x));
+    }
+    return curve;
+  }
+
+  function pluckBuffer(ctx, freq, duration = 1.6, decay = 0.997) {
+    const sr  = ctx.sampleRate;
+    const len = Math.floor(sr * duration);
+    const N   = Math.max(2, Math.floor(sr / freq));
+    const buf = ctx.createBuffer(1, len, sr);
+    const out = buf.getChannelData(0);
+    const ring = new Float32Array(N);
+    for (let i = 0; i < N; i++) ring[i] = (Math.random() * 2 - 1);
+    let p = 0;
+    for (let i = 0; i < len; i++) {
+      const cur = ring[p];
+      const nxt = ring[(p + 1) % N];
+      out[i]   = cur;
+      ring[p]  = (cur + nxt) * 0.5 * decay;
+      p = (p + 1) % N;
+    }
+    return buf;
+  }
+
+  // ============================================================
+  //  ドラム合成 (when は audioCtx 絶対時刻)
+  // ============================================================
+  function hitKick(out, when, vel) {
+    const ctx = audioCtx;
+    const osc = ctx.createOscillator();
+    osc.type  = 'sine';
+    osc.frequency.setValueAtTime(120, when);
+    osc.frequency.exponentialRampToValueAtTime(38, when + 0.09);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(vel * 1.25, when);
+    env.gain.exponentialRampToValueAtTime(0.0001, when + 0.42);
+    osc.connect(env); env.connect(out);
+    osc.start(when); osc.stop(when + 0.45);
+
+    // ビーターのクリック
+    const sr = ctx.sampleRate;
+    const cb = ctx.createBuffer(1, Math.floor(sr * 0.012), sr);
+    const cd = cb.getChannelData(0);
+    for (let i = 0; i < cd.length; i++) cd[i] = Math.random() * 2 - 1;
+    const cs = ctx.createBufferSource(); cs.buffer = cb;
+    const cf = ctx.createBiquadFilter(); cf.type = 'highpass'; cf.frequency.value = 1500;
+    const cg = ctx.createGain();
+    cg.gain.setValueAtTime(vel * 0.55, when);
+    cg.gain.exponentialRampToValueAtTime(0.0001, when + 0.012);
+    cs.connect(cf); cf.connect(cg); cg.connect(out);
+    cs.start(when); cs.stop(when + 0.013);
+
+    // ビジュアル: kick の壁時計時刻を記録 (ペース UI 用)
+    const wallMs = (when - audioCtx.currentTime) * 1000 + Date.now();
+    setTimeout(() => { lastKickPulse = performance.now(); }, Math.max(0, wallMs - Date.now()));
+  }
+
+  function hitSnare(out, when, vel) {
+    const ctx = audioCtx;
+    const osc = ctx.createOscillator();
+    osc.type  = 'triangle';
+    osc.frequency.setValueAtTime(220, when);
+    osc.frequency.exponentialRampToValueAtTime(140, when + 0.08);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(vel * 0.45, when);
+    og.gain.exponentialRampToValueAtTime(0.0001, when + 0.13);
+    osc.connect(og); og.connect(out);
+    osc.start(when); osc.stop(when + 0.15);
+
+    const sr = ctx.sampleRate;
+    const nb = ctx.createBuffer(1, Math.floor(sr * 0.18), sr);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns = ctx.createBufferSource(); ns.buffer = nb;
+    const nf = ctx.createBiquadFilter(); nf.type = 'highpass'; nf.frequency.value = 850;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.85, when);
+    ng.gain.exponentialRampToValueAtTime(0.0001, when + 0.16);
+    ns.connect(nf); nf.connect(ng); ng.connect(out);
+    ns.start(when); ns.stop(when + 0.18);
+  }
+
+  function hitHihat(out, when, vel, open = false) {
+    const ctx = audioCtx;
+    const sr  = ctx.sampleRate;
+    const dur = open ? 0.24 : 0.045;
+    const nb  = ctx.createBuffer(1, Math.floor(sr * dur), sr);
+    const nd  = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns  = ctx.createBufferSource(); ns.buffer = nb;
+    const nf  = ctx.createBiquadFilter();
+    nf.type   = 'highpass'; nf.frequency.value = 7200; nf.Q.value = 0.8;
+    const nf2 = ctx.createBiquadFilter();
+    nf2.type  = 'bandpass'; nf2.frequency.value = 9500; nf2.Q.value = 0.5;
+    const ng  = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.42, when);
+    ng.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+    ns.connect(nf); nf.connect(nf2); nf2.connect(ng); ng.connect(out);
+    ns.start(when); ns.stop(when + dur + 0.01);
+  }
+
+  function hitCrash(out, when, vel) {
+    const ctx = audioCtx;
+    const sr  = ctx.sampleRate;
+    const dur = 1.7;
+    const nb  = ctx.createBuffer(1, Math.floor(sr * dur), sr);
+    const nd  = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns  = ctx.createBufferSource(); ns.buffer = nb;
+    const nf  = ctx.createBiquadFilter();
+    nf.type   = 'highpass'; nf.frequency.value = 4000;
+    const ng  = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.55, when);
+    ng.gain.exponentialRampToValueAtTime(0.06, when + 0.06);
+    ng.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+    ns.connect(nf); nf.connect(ng); ng.connect(out);
+    ns.start(when); ns.stop(when + dur + 0.02);
+  }
+
+  function hitTom(out, when, freq, vel) {
+    const ctx = audioCtx;
+    const osc = ctx.createOscillator();
+    osc.type  = 'sine';
+    osc.frequency.setValueAtTime(freq * 1.4, when);
+    osc.frequency.exponentialRampToValueAtTime(freq * 0.7, when + 0.18);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(vel * 0.7, when);
+    env.gain.exponentialRampToValueAtTime(0.0001, when + 0.32);
+    osc.connect(env); env.connect(out);
+    osc.start(when); osc.stop(when + 0.34);
+
+    const sr = ctx.sampleRate;
+    const nb = ctx.createBuffer(1, Math.floor(sr * 0.08), sr);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns = ctx.createBufferSource(); ns.buffer = nb;
+    const nf = ctx.createBiquadFilter();
+    nf.type  = 'bandpass'; nf.frequency.value = freq * 3; nf.Q.value = 1.5;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.30, when);
+    ng.gain.exponentialRampToValueAtTime(0.0001, when + 0.08);
+    ns.connect(nf); nf.connect(ng); ng.connect(out);
+    ns.start(when); ns.stop(when + 0.09);
+  }
+
+  // ============================================================
+  //  ベース (saw + sub sine + LPF アタックフィルタ)
+  // ============================================================
+  function playBass(out, when, freq, vel, dur = 0.45) {
+    const ctx = audioCtx;
+    const osc = ctx.createOscillator();
+    osc.type  = 'sawtooth';
+    osc.frequency.value = freq;
+
+    const sub = ctx.createOscillator();
+    sub.type  = 'sine';
+    sub.frequency.value = freq * 0.5;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type  = 'lowpass';
+    lp.frequency.setValueAtTime(freq * 7, when);
+    lp.frequency.exponentialRampToValueAtTime(freq * 2.4, when + dur * 0.5);
+    lp.Q.value = 2.5;
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0, when);
+    env.gain.linearRampToValueAtTime(vel * 0.55, when + 0.006);
+    env.gain.exponentialRampToValueAtTime(0.0001, when + dur);
+
+    const subEnv = ctx.createGain();
+    subEnv.gain.setValueAtTime(0, when);
+    subEnv.gain.linearRampToValueAtTime(vel * 0.30, when + 0.008);
+    subEnv.gain.exponentialRampToValueAtTime(0.0001, when + dur * 0.9);
+
+    osc.connect(lp); lp.connect(env); env.connect(out);
+    sub.connect(subEnv); subEnv.connect(out);
+    osc.start(when); osc.stop(when + dur + 0.05);
+    sub.start(when); sub.stop(when + dur + 0.05);
+  }
+
+  // ============================================================
+  //  ギター (Karplus-Strong 3声トリプル + ストローク)
+  // ============================================================
+  function pickGuitar(amps, when, freq, vel, dur = 0.95) {
+    const ctx = audioCtx;
+    const sr  = ctx.sampleRate;
+    const voices = [
+      { detune: 0.997, delay: 0.012, gain: 0.55, ampIdx: 0 },
+      { detune: 1.000, delay: 0.000, gain: 0.65, ampIdx: 1 },
+      { detune: 1.003, delay: 0.020, gain: 0.55, ampIdx: 2 },
+    ];
+    voices.forEach((v) => {
+      const start = when + v.delay;
+      const buf   = pluckBuffer(ctx, freq * v.detune, dur, 0.996);
+      const src   = ctx.createBufferSource(); src.buffer = buf;
+      const env   = ctx.createGain();
+      env.gain.setValueAtTime(0, start);
+      env.gain.linearRampToValueAtTime(vel * v.gain, start + 0.005);
+      env.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      src.connect(env); env.connect(amps[v.ampIdx].inp);
+      src.start(start); src.stop(start + dur + 0.05);
+    });
+
+    // ピックアタック
+    const pkB = ctx.createBuffer(1, Math.floor(sr * 0.008), sr);
+    const pkD = pkB.getChannelData(0);
+    for (let i = 0; i < pkD.length; i++) pkD[i] = Math.random() * 2 - 1;
+    const pk  = ctx.createBufferSource(); pk.buffer = pkB;
+    const pkF = ctx.createBiquadFilter(); pkF.type = 'highpass'; pkF.frequency.value = 2200;
+    const pkG = ctx.createGain();
+    pkG.gain.setValueAtTime(vel * 0.20, when);
+    pkG.gain.exponentialRampToValueAtTime(0.0001, when + 0.012);
+    pk.connect(pkF); pkF.connect(pkG); pkG.connect(amps[1].inp);
+    pk.start(when); pk.stop(when + 0.013);
+  }
+
+  function strumChord(amps, when, voicing, vel, dur = 1.4, downstroke = true) {
+    voicing.forEach((f, i) => {
+      const idx = downstroke ? i : (voicing.length - 1 - i);
+      const offsetSec = idx * (0.005 + Math.random() * 0.005);
+      const noteVel = vel * (0.95 - i * 0.04);
+      pickGuitar(amps, when + offsetSec, f, noteVel, dur);
+    });
+  }
+
+  function makeGuitarAmp(ctx, panValue, distortAmount) {
+    const inp  = ctx.createGain(); inp.gain.value = 1.0;
+    const dist = ctx.createWaveShaper();
+    dist.curve = makeDistortionCurve(distortAmount);
+    dist.oversample = '4x';
+    const tone = ctx.createBiquadFilter();
+    tone.type  = 'lowpass'; tone.frequency.value = 3200; tone.Q.value = 0.7;
+    const pres = ctx.createBiquadFilter();
+    pres.type  = 'peaking'; pres.frequency.value = 2400;
+    pres.gain.value = 4; pres.Q.value = 1.2;
+    const pan  = ctx.createStereoPanner(); pan.pan.value = panValue;
+    inp.connect(dist); dist.connect(tone); tone.connect(pres); pres.connect(pan);
+    return { inp, dist, tone, pres, pan };
+  }
+
+  // ============================================================
+  //  音響グラフ初期化
+  // ============================================================
+  let _g = null;   // graph refs
+
+  async function initAudio() {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+      latencyHint: 'interactive',
+    });
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    // audioCtx.currentTime=0 の壁時計時刻 (server オフセット込みで考えるための基準)
+    audioCtxStartWallMs = Date.now() - audioCtx.currentTime * 1000;
+
+    const master = audioCtx.createGain();
+    master.gain.value = 0.78;
+    master.connect(audioCtx.destination);
+
+    const comp = audioCtx.createDynamicsCompressor();
+    comp.threshold.value = -12; comp.knee.value = 6;
+    comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.15;
+    comp.connect(master);
+
+    const convRev = createConvReverb(audioCtx, 3.5, 2.6);
+    convRev.connect(master);
+
+    const instrBus = audioCtx.createGain(); instrBus.gain.value = 1.0;
+    instrBus.connect(comp);
+
+    const rvSend = audioCtx.createGain(); rvSend.gain.value = 0.30;
+    instrBus.connect(rvSend); rvSend.connect(convRev);
+
+    // ─── ギター 3 アンプ (L/C/R) ───
+    const song = SONGS[_activeSongIdx];
+    const guitarAmps = [
+      makeGuitarAmp(audioCtx, -0.7, song.drive - 5),
+      makeGuitarAmp(audioCtx,  0.0, song.drive),
+      makeGuitarAmp(audioCtx,  0.7, song.drive - 5),
+    ];
+    const guitarBus = audioCtx.createGain(); guitarBus.gain.value = 0.40;
+    guitarAmps.forEach(a => a.pan.connect(guitarBus));
+    const guitarDuck = audioCtx.createGain(); guitarDuck.gain.value = 1.0;
+    guitarBus.connect(guitarDuck); guitarDuck.connect(instrBus);
+
+    // ─── ベース ───
+    const bassAmp = audioCtx.createGain(); bassAmp.gain.value = 1.0;
+    const bassToneFilt = audioCtx.createBiquadFilter();
+    bassToneFilt.type = 'lowpass'; bassToneFilt.frequency.value = 850; bassToneFilt.Q.value = 1.0;
+    const bassPunch = audioCtx.createBiquadFilter();
+    bassPunch.type = 'peaking'; bassPunch.frequency.value = 90;
+    bassPunch.gain.value = 5; bassPunch.Q.value = 1.5;
+    const bassBus = audioCtx.createGain(); bassBus.gain.value = 0.62;
+    bassAmp.connect(bassToneFilt); bassToneFilt.connect(bassPunch); bassPunch.connect(bassBus);
+    const bassDuck = audioCtx.createGain(); bassDuck.gain.value = 1.0;
+    bassBus.connect(bassDuck); bassDuck.connect(instrBus);
+
+    // ─── ドラム ───
+    const drumBus = audioCtx.createGain(); drumBus.gain.value = 0.85;
+    drumBus.connect(instrBus);
+
+    // ─── ドローン (G1 サブベース) ───
+    const droneOsc = audioCtx.createOscillator();
+    droneOsc.type  = 'triangle';
+    droneOsc.frequency.value = song.tonic;
+    const droneGain = audioCtx.createGain(); droneGain.gain.value = 0;  // tier 3 で立ち上げ
+    droneOsc.connect(droneGain); droneGain.connect(bassAmp);
+    droneOsc.start();
+
+    // ─── アンプヒス (環境ノイズ) ───
+    const envBuf = audioCtx.createBuffer(1, audioCtx.sampleRate * 4, audioCtx.sampleRate);
+    const ed = envBuf.getChannelData(0);
+    for (let i = 0; i < ed.length; i++) ed[i] = Math.random() * 2 - 1;
+    const envSrc = audioCtx.createBufferSource();
+    envSrc.buffer = envBuf; envSrc.loop = true;
+    const envFilt = audioCtx.createBiquadFilter();
+    envFilt.type  = 'bandpass'; envFilt.frequency.value = 800; envFilt.Q.value = 0.7;
+    const envGain = audioCtx.createGain(); envGain.gain.value = 0.02;
+    envSrc.connect(envFilt); envFilt.connect(envGain); envGain.connect(rvSend);
+    envSrc.start();
+
+    _g = {
+      master, comp, convRev, instrBus, rvSend,
+      guitarAmps, guitarBus, guitarDuck,
+      bassAmp, bassBus, bassDuck,
+      drumBus, droneOsc, droneGain,
+      envFilt, envGain,
+    };
+
+    applySongTone(_activeSongIdx);
+
+    // 起動アクセント
+    const t0 = audioCtx.currentTime + 0.05;
+    hitKick(drumBus, t0, 0.6);
+    hitCrash(drumBus, t0, 0.45);
+    strumChord(guitarAmps, t0, CHORDS.G.voicing, 0.55, 1.4, true);
+
+    startScheduler();
+    startTierLerper();
+    startHudLoop();
+  }
+
+  // ─── 曲のトーンをアンプに反映 ───
+  function applySongTone(idx) {
+    if (!_g) return;
+    const song = SONGS[idx];
+    const t = audioCtx.currentTime;
+    const offs = [-5, 0, -5];
+    _g.guitarAmps.forEach((amp, i) => {
+      amp.dist.curve = makeDistortionCurve(song.drive + offs[i]);
+      amp.tone.frequency.linearRampToValueAtTime(song.tone, t + 0.6);
+      amp.pres.gain.linearRampToValueAtTime(song.presence, t + 0.6);
+    });
+    _g.droneOsc.frequency.linearRampToValueAtTime(song.tonic, t + 1.2);
+  }
+
+  // ─── kick → guitar/bass duck ───
+  function duckSidechain(when, amount = 0.45, recoverMs = 180) {
+    if (!_g) return;
+    [_g.guitarDuck, _g.bassDuck].forEach((g) => {
+      g.gain.cancelScheduledValues(when - 0.001);
+      g.gain.setValueAtTime(g.gain.value, when - 0.001);
+      g.gain.linearRampToValueAtTime(amount, when + 0.010);
+      g.gain.linearRampToValueAtTime(1.0,    when + recoverMs / 1000);
+    });
+  }
+
+  // ============================================================
+  //  時刻変換: server-wall-ms → audioCtx 絶対時刻 (秒)
+  // ============================================================
+  function audioTimeFromServerWall(serverWallMs) {
+    const localWallMs = serverWallMs - serverOffsetMs;
+    return (localWallMs - audioCtxStartWallMs) / 1000;
+  }
+
+  // ============================================================
+  //  Tier Lerper: 接続人数に応じてレイヤーを滑らかに上下
+  // ============================================================
+  function updateTierTargets() {
+    for (let i = 0; i < TIER_THRESHOLD.length; i++) {
+      tierTarget[i] = connectedCount >= TIER_THRESHOLD[i] ? 1 : 0;
+    }
+  }
+
+  function startTierLerper() {
+    function tick() {
+      for (let i = 0; i < tierLevel.length; i++) {
+        // 約 1.2 秒で目標へ (60fps × 0.012)
+        tierLevel[i] += (tierTarget[i] - tierLevel[i]) * 0.012;
+      }
+      // ドローンとリバーブ送りを tier に追従させる
+      if (_g) {
+        const t = audioCtx.currentTime;
+        _g.droneGain.gain.linearRampToValueAtTime(0.06 * tierLevel[3], t + 0.2);
+        _g.rvSend.gain.linearRampToValueAtTime(
+          0.18 + 0.10 * tierLevel[5] + 0.08 * tierLevel[7], t + 0.4
+        );
+      }
+      requestAnimationFrame(tick);
+    }
+    tick();
+  }
+
+  // ============================================================
+  //  ビート・スケジューラ (lookahead 250ms / tick 25ms)
+  //  サーバー壁時計に揃えた measureN を絶対時刻でキューイングする。
+  // ============================================================
+  const LOOKAHEAD_S      = 0.30;
+  const SCHED_INTERVAL_MS = 25;
+
+  // フレーズ用の閉包変数 (リード)
+  let _leadStep = 0;
+  let _leadPhraseQueue = 0;
+
+  function startScheduler() {
+    let timer = null;
+    const tick = () => {
+      try { scheduleAhead(); } catch (e) { console.warn('[sched]', e); }
+      timer = setTimeout(tick, SCHED_INTERVAL_MS);
+    };
+    tick();
+  }
+
+  function scheduleAhead() {
+    if (!_g || !audioCtx) return;
+    const song = SONGS[_activeSongIdx];
+    const bpm  = song.bpmBase;
+    const sixteenthMs = 60000 / bpm / 4;
+    const measureMs   = sixteenthMs * 16;
+
+    const now = audioCtx.currentTime;
+    const horizon = now + LOOKAHEAD_S;
+
+    // 現在の (server 壁時計上の) 経過 ms から measure index を逆算し、
+    // _scheduledThroughMeasure が -1 ならそこから先をキューイング開始
+    const serverNowMs = Date.now() + serverOffsetMs;
+    if (_scheduledThroughMeasure < 0) {
+      const elapsedMs = serverNowMs - _songStartedAtServer;
+      _scheduledThroughMeasure = Math.max(-1, Math.floor(elapsedMs / measureMs) - 1);
+    }
+
+    let measureN = _scheduledThroughMeasure + 1;
+    while (measureN < 100000) {
+      const measureWallMs = _songStartedAtServer + measureN * measureMs;
+      const measureAudioT = audioTimeFromServerWall(measureWallMs);
+      if (measureAudioT > horizon) break;
+
+      // 過去すぎる小節はスキップ (急なジャンプや起動直後)
+      if (measureAudioT < now - 0.05) {
+        _scheduledThroughMeasure = measureN;
+        measureN++;
+        continue;
+      }
+
+      scheduleMeasure(measureN, measureAudioT, sixteenthMs / 1000, song);
+      _scheduledThroughMeasure = measureN;
+      measureN++;
+    }
+  }
+
+  function scheduleMeasure(measureN, t0, sixteenthSec, song) {
+    const drumBus    = _g.drumBus;
+    const guitarAmps = _g.guitarAmps;
+    const bassAmp    = _g.bassAmp;
+
+    const chordName = song.progression[measureN % song.progression.length];
+    const chord     = CHORDS[chordName];
+    const feel      = song.drumFeel;
+
+    // 基本ベロシティ (1人だと弱め、人が増えると上がる)
+    const base = 0.34 + Math.min(connectedCount, 8) * 0.025;
+
+    for (let s = 0; s < 16; s++) {
+      const tStep = t0 + sixteenthSec * s;
+
+      // ── ハイハット (tier 2: n>=3) ──
+      let hatStep = false, hatVel = 0, hatOpen = false;
+      if (feel === 'driving') {
+        hatStep = true;
+        hatVel = base * (s % 4 === 0 ? 0.85 : 0.40);
+      } else if (feel === 'half') {
+        hatStep = (s % 4 === 0);
+        hatVel = base * 0.55;
+      } else {
+        hatStep = (s % 2 === 0);
+        hatVel = base * (s % 4 === 0 ? 0.85 : 0.55);
+        hatOpen = (s === 14 && Math.random() < 0.30);
+      }
+      if (hatStep) {
+        const v = hatVel * tierLevel[2];
+        if (v > 0.01) hitHihat(drumBus, tStep, v, hatOpen);
+      }
+
+      // ── キック (tier 0: 常時) ──
+      let kickHere = false;
+      if (feel === 'driving') {
+        kickHere = s === 0 || s === 6 || s === 8 || (s === 10 && Math.random() < 0.5);
+      } else if (feel === 'half') {
+        kickHere = s === 0 || s === 10;
+      } else {
+        kickHere = s === 0 || s === 8 || (s === 6 && Math.random() < 0.25);
+      }
+      if (kickHere) {
+        const v = base * tierLevel[0];
+        if (v > 0.01) {
+          hitKick(drumBus, tStep, v);
+          duckSidechain(tStep);
+        }
+      }
+
+      // ── スネア (tier 1: n>=2) ──
+      let snareHere = false;
+      if (feel === 'half') snareHere = s === 8;
+      else snareHere = s === 4 || s === 12;
+      if (snareHere) {
+        const v = base * 0.85 * tierLevel[1];
+        if (v > 0.01) hitSnare(drumBus, tStep, v);
+      }
+      // ゴーストスネア (tier 7: n>=8)
+      if (feel === 'anthemic' && (s === 10 || s === 14) && Math.random() < 0.30) {
+        const v = base * 0.30 * tierLevel[7];
+        if (v > 0.01) hitSnare(drumBus, tStep, v);
+      }
+
+      // ── ベース 8分歩き (tier 0) ──
+      if (s % 2 === 0) {
+        const beatN = s >> 1;
+        const bIdx  = beatN % chord.bassNotes.length;
+        const bFreq = chord.bassNotes[bIdx];
+        const bvel  = base * (s === 0 ? 0.80 : (s % 4 === 0 ? 0.65 : 0.50));
+        const v = bvel * tierLevel[0];
+        if (v > 0.01) playBass(bassAmp, tStep, bFreq, v, sixteenthSec * 1.6);
+      }
+
+      // ── 主ストローク 1拍目 (tier 0) ──
+      if (s === 0) {
+        const v = base * 0.90 * tierLevel[0];
+        if (v > 0.01) strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 12, true);
+      }
+
+      // ── 3拍目アップストローク (tier 4: n>=5) ──
+      if (s === 8) {
+        const v = base * 0.55 * tierLevel[4];
+        if (v > 0.01) strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 6, false);
+      }
+
+      // ── 8分裏ジャカジャカ (tier 4) ──
+      if ((s === 4 || s === 12) && Math.random() < 0.50) {
+        const v = base * 0.30 * tierLevel[4];
+        if (v > 0.01) strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 4, true);
+      }
+
+      // ── タムフィル (tier 7) ──
+      if (measureN % 4 === 3 && s >= 12 && s % 2 === 0 && Math.random() < 0.55) {
+        const v = base * 0.70 * tierLevel[7];
+        if (v > 0.01) {
+          const tomFreq = 110 + (s - 12) * 22;
+          hitTom(drumBus, tStep, tomFreq, v);
+        }
+      }
+
+      // ── オープンハット強調 (tier 7) ──
+      if (s === 7 && Math.random() < 0.25) {
+        const v = base * 0.55 * tierLevel[7];
+        if (v > 0.01) hitHihat(drumBus, tStep, v, true);
+      }
+    }
+
+    // クラッシュ: 進行ループ頭 (tier 6: n>=7)
+    if (measureN % song.progression.length === 0) {
+      const v = base * 0.6 * tierLevel[6];
+      if (v > 0.01) hitCrash(drumBus, t0, v);
+    }
+
+    // ── リード/ハーモニーは小節をまたいだフレーズなので
+    //   1 小節分のリード音をこの小節内に配置する ──
+    scheduleLeadForMeasure(measureN, t0, sixteenthSec, chord);
+  }
+
+  function scheduleLeadForMeasure(measureN, t0, sixteenthSec, chord) {
+    const guitarAmps = _g.guitarAmps;
+    const lead = chord.lead;
+    if (!lead) return;
+
+    // tier 5 (n>=6) でリード単音を 1 小節に 3〜5 音入れる
+    if (tierLevel[5] < 0.02) return;
+
+    const noteCount = 2 + ((measureN % 3 === 0) ? 1 : 2);  // 3〜4 音
+    for (let i = 0; i < noteCount; i++) {
+      const stepIdx = 1 + Math.floor((i / noteCount) * 14);
+      const tStep   = t0 + sixteenthSec * stepIdx;
+
+      // フレーズ内の動き
+      if (_leadPhraseQueue <= 0) {
+        _leadPhraseQueue = 2 + Math.floor(Math.random() * 3);
+        _leadStep = Math.floor(Math.random() * 3);
+      } else if (Math.random() < 0.7) {
+        _leadStep += Math.random() < 0.55 ? 1 : -1;
+        _leadStep = Math.max(0, Math.min(lead.length - 1, _leadStep));
+      }
+      const freq = lead[_leadStep];
+      const isLast = _leadPhraseQueue === 1;
+      const dur = isLast ? 0.7 + Math.random() * 0.4 : 0.35 + Math.random() * 0.25;
+      const lvel = (0.40 + Math.min(connectedCount, 8) * 0.02) * tierLevel[5];
+
+      if (lvel > 0.01) pickGuitar(guitarAmps, tStep, freq, lvel, dur);
+
+      // ── ハーモニー 3度上 (tier 6: n>=7) ──
+      if (isLast && tierLevel[6] > 0.05 && Math.random() < 0.4) {
+        const harmIdx = Math.max(0, _leadStep - 2);
+        const hvel = lvel * 0.55 * tierLevel[6];
+        if (hvel > 0.01) {
+          pickGuitar(guitarAmps, tStep + 0.025, lead[harmIdx], hvel, dur * 0.85);
+        }
+      }
+      _leadPhraseQueue--;
+    }
+  }
+
+  // ============================================================
+  //  HUD + ビジュアル
+  // ============================================================
+  function updateHud() {
+    const c = document.getElementById('count');
+    const l = document.getElementById('layers');
+    if (c) c.textContent = `参加 ${connectedCount} 人`;
+    if (l) {
+      const active = TIER_THRESHOLD.filter(t => connectedCount >= t).length;
+      l.textContent = `レイヤー ${active}/${TIER_THRESHOLD.length}`;
+    }
+  }
+  updateHud();
+
+  function startHudLoop() {
+    setInterval(updateHud, 1000);
+  }
+
+  // ============================================================
+  //  パーティクル + キックパルス
+  // ============================================================
+  const canvas = document.getElementById('fx');
+  const ctx2d  = canvas.getContext('2d');
+  let cw, ch;
+  const resize = () => { cw = canvas.width = innerWidth; ch = canvas.height = innerHeight; };
+  resize(); addEventListener('resize', resize);
+
+  const particles = Array.from({ length: 110 }, () => ({
+    x: Math.random(), y: Math.random(),
+    vx: (Math.random() - 0.5) * 0.0003,
+    vy: -(Math.random() * 0.0004 + 0.0001),
+    size: Math.random() * 2.4 + 0.5,
+    alpha: Math.random() * 0.6 + 0.15,
+    hue: Math.random() * 30 + 25,
+  }));
+
+  function drawFx() {
+    requestAnimationFrame(drawFx);
+    ctx2d.clearRect(0, 0, cw, ch);
+
+    // キックの脈動 (kick から 200ms 程度で減衰)
+    const since = performance.now() - lastKickPulse;
+    const pulse = Math.max(0, 1 - since / 220);
+
+    // 接続人数に応じた中央光輪
+    const radius = Math.min(cw, ch) * (0.18 + Math.min(connectedCount, 16) * 0.025) * (1 + pulse * 0.4);
+    const grad = ctx2d.createRadialGradient(cw / 2, ch / 2, 0, cw / 2, ch / 2, radius);
+    grad.addColorStop(0, `rgba(255,180,60,${0.18 + pulse * 0.35})`);
+    grad.addColorStop(1, 'rgba(255,180,60,0)');
+    ctx2d.fillStyle = grad;
+    ctx2d.fillRect(0, 0, cw, ch);
+
+    // パーティクル
+    for (const p of particles) {
+      p.x += p.vx; p.y += p.vy;
+      if (p.y < -0.02) { p.y = 1.02; p.x = Math.random(); }
+      ctx2d.beginPath();
+      ctx2d.arc(p.x * cw, p.y * ch, p.size * (1 + pulse * 0.6), 0, Math.PI * 2);
+      ctx2d.fillStyle = `hsla(${p.hue},80%,70%,${p.alpha})`;
+      ctx2d.fill();
+    }
+  }
+  drawFx();
   </script>
 </body>
 </html>
