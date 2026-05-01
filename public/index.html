@@ -67,6 +67,16 @@
       font-size: 0.65rem;
       color: rgba(160,200,255,0.55);
       letter-spacing: 0.2em;
+      pointer-events: auto;
+      cursor: pointer;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #motion-line.actionable {
+      color: rgba(255,200,100,0.85);
+      text-decoration: underline;
+      text-decoration-color: rgba(255,200,100,0.4);
+      text-underline-offset: 3px;
     }
     #song-name {
       position: fixed; top: 1rem; left: 50%; transform: translateX(-50%);
@@ -1132,6 +1142,7 @@
     }
     if (m) {
       const lines = [];
+      let actionable = false;
       // AudioContext state がおかしい場合は最優先で表示
       if (audioCtx && audioCtx.state !== 'running') {
         lines.push('⚠️ 音停止中 — 画面をタップ/サイレント解除');
@@ -1141,13 +1152,38 @@
       } else if (M.status === 'requesting') {
         lines.push('🚲 センサー許可待ち…');
       } else if (M.status === 'denied') {
-        lines.push('🚲 センサー拒否 (リロードで再要求)');
+        lines.push('🚲 センサー無効 — タップで再要求');
+        actionable = true;
+      } else if (M.status === 'idle') {
+        lines.push('🚲 センサー OFF — タップで有効化');
+        actionable = true;
       } else if (M.status === 'unsupported') {
         lines.push('🚲 センサー非対応');
       }
       m.innerHTML = lines.join('<br/>');
+      m.classList.toggle('actionable', actionable);
     }
   }
+
+  // ── HUD のセンサー行をタップ → 再要求 → ダメなら Safari 設定手順を案内 ──
+  document.getElementById('motion-line').addEventListener('click', async () => {
+    if (M.status === 'granted' || M.status === 'requesting' || M.status === 'unsupported') return;
+    const before = M.status;
+    await initMotion();
+    // 状態が変わらず denied のままなら、iOS Safari の per-site 設定が原因の可能性が高い
+    if (M.status === 'denied' && before === 'denied') {
+      alert([
+        'センサーが無効のままです。',
+        '',
+        'iPhone の場合 — Safari の URL バー左の「ぁあ (AA)」',
+        '→「Web サイトの設定」',
+        '→「モーションと方向のアクセス」',
+        '→「許可」を選んで、ページをリロードしてください。',
+        '',
+        '一度「許可しない」を押すとリロードでは戻らない仕様です。'
+      ].join('\n'));
+    }
+  });
   updateHud();
 
   function startHudLoop() {
