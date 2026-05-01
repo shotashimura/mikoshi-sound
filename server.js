@@ -63,6 +63,36 @@ const broadcastClients = () => {
   io.emit('clients_update', { clients: clientsPayload(), serverNow: Date.now() });
 };
 
+// ============================================================
+//  揺れ集約 (チャリ振動センサー)
+//  - motion_data: クライアントがローパス済みエネルギー (0..1) を ~5Hz 送信
+//  - motion_peak: 鋭いジョルト (段差等) を即時送信
+//  サーバーは 1.5 秒以上更新が無いクライアントを除外して平均を取り
+//  250ms 周期で world_motion をブロードキャスト。
+// ============================================================
+const motionState = new Map();   // socketId -> { magnitude, lastUpdate }
+const STALE_MOTION_MS = 1500;
+
+const broadcastMotion = () => {
+  const now = Date.now();
+  let sum = 0, peak = 0, count = 0;
+  for (const [id, m] of motionState) {
+    if (now - m.lastUpdate < STALE_MOTION_MS) {
+      sum += m.magnitude;
+      if (m.magnitude > peak) peak = m.magnitude;
+      count++;
+    }
+  }
+  const avg = count > 0 ? sum / count : 0;
+  io.emit('world_motion', {
+    worldEnergy: avg,
+    peakEnergy:  peak,
+    contributors: count,
+    serverNow: now,
+  });
+};
+setInterval(broadcastMotion, 250);
+
 io.on('connection', (socket) => {
   const voiceIndex = _voiceCounter++;
   clients.set(socket.id, { voiceIndex });
@@ -81,8 +111,28 @@ io.on('connection', (socket) => {
     if (typeof ack === 'function') ack(Date.now());
   });
 
+  // 連続揺れエネルギー
+  socket.on('motion_data', (data) => {
+    const mag = Math.max(0, Math.min(1, +(data && data.magnitude) || 0));
+    motionState.set(socket.id, { magnitude: mag, lastUpdate: Date.now() });
+  });
+
+  // ピーク (送信元以外へ即時ブロードキャスト。送信元はローカルで先に
+  // 鳴らしているのでループバックさせない)
+  socket.on('motion_peak', (data) => {
+    const c = clients.get(socket.id);
+    if (!c) return;
+    const mag = Math.max(0, Math.min(1, +(data && data.magnitude) || 0));
+    socket.broadcast.emit('motion_peak', {
+      voiceIndex: c.voiceIndex,
+      magnitude:  mag,
+      serverNow:  Date.now(),
+    });
+  });
+
   socket.on('disconnect', () => {
     clients.delete(socket.id);
+    motionState.delete(socket.id);
     broadcastClients();
     console.log(`[-] ${socket.id} (count=${clients.size})`);
   });
