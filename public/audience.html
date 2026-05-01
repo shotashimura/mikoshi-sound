@@ -79,14 +79,59 @@
   'use strict';
 
   // ============================================================
-  //  四七抜き短音階 (D E G A C) 周波数テーブル
+  //  G メジャー + コード進行 (Oasis アンセム仕様)
+  //  G - D - Em - Cadd9 (I-V-vi-IV、Wonderwall 系)
   // ============================================================
-  const YO = [
-    73.42, 82.41, 98.00, 110.00, 130.81,
-    146.83, 164.81, 196.00, 220.00, 261.63,
-    293.66, 329.63, 392.00, 440.00, 523.25,
-    587.33, 659.26, 784.00,
+  const CHORDS = {
+    G: {
+      bassNotes: [49.00, 73.42, 98.00, 123.47],
+      voicing:  [196.00, 246.94, 293.66, 392.00, 493.88],
+      lead:     [329.63, 392.00, 440.00, 493.88, 587.33, 659.26],
+    },
+    D: {
+      bassNotes: [73.42, 110.00, 146.83, 184.997],
+      voicing:  [146.83, 184.997, 220.00, 293.66, 369.99],
+      lead:     [369.99, 440.00, 493.88, 587.33, 659.26, 739.99],
+    },
+    Em: {
+      bassNotes: [82.41, 123.47, 164.81, 196.00],
+      voicing:  [164.81, 196.00, 246.94, 329.63, 392.00],
+      lead:     [329.63, 392.00, 440.00, 493.88, 587.33, 659.26],
+    },
+    Cadd9: {
+      bassNotes: [65.41, 98.00, 130.81, 164.81],
+      voicing:  [130.81, 164.81, 196.00, 261.63, 293.66],
+      lead:     [329.63, 392.00, 440.00, 493.88, 523.25, 659.26],
+    },
+    Am: {
+      bassNotes: [55.00, 82.41, 110.00, 130.81],
+      voicing:  [110.00, 130.81, 164.81, 220.00, 261.63],
+      lead:     [329.63, 392.00, 440.00, 493.88, 523.25, 659.26],
+    },
+    F: {
+      bassNotes: [43.65, 65.41, 87.31, 110.00],
+      voicing:  [87.31, 130.81, 174.61, 220.00, 261.63],
+      lead:     [349.23, 440.00, 523.25, 587.33, 659.26, 698.46],
+    },
+    C: {
+      bassNotes: [65.41, 98.00, 130.81, 164.81],
+      voicing:  [130.81, 164.81, 196.00, 261.63, 329.63],
+      lead:     [329.63, 392.00, 440.00, 493.88, 523.25, 659.26],
+    },
+  };
+
+  // ─── SONGS: 4 曲を 3:30 ごとに循環 (Oasis アンセム集) ───
+  const SONGS = [
+    { name: 'Wonderwall',     progression: ['G','D','Em','Cadd9'], tonic: 49.00, drive: 25 },
+    { name: 'Live Forever',   progression: ['G','D','Am','C'],     tonic: 49.00, drive: 32 },
+    { name: 'Anger',          progression: ['C','G','Am','F'],     tonic: 65.41, drive: 18 },
+    { name: 'RocknRoll Star', progression: ['G','F','G','F'],      tonic: 49.00, drive: 42 },
   ];
+  const SONG_DURATION_MS = 210000;
+
+  let _activeSongIdx     = 0;
+  let _activeProgression = SONGS[0].progression;
+  let _activeDrive       = SONGS[0].drive;
 
   // ============================================================
   //  状態
@@ -282,7 +327,8 @@
   }, 5000);
 
   // ============================================================
-  //  Pillar 3: ピュア Web Audio API ユーティリティ
+  //  Pillar 3: ピュア Web Audio API ロックキット
+  //  観客側は「会場で遠くから聴こえる」ニュアンスでアンビエント寄り。
   // ============================================================
 
   // 合成インパルスレスポンスによるコンボリューションリバーブ
@@ -301,175 +347,172 @@
     return conv;
   }
 
-  // 太鼓 ─ ノイズ帯域通過 + サインピッチ感
-  function hitTaiko(ctx, output, baseFreq, vel) {
-    const now = ctx.currentTime;
-    const sr  = ctx.sampleRate;
-    const bodyBuf = ctx.createBuffer(1, Math.floor(sr * 0.9), sr);
-    const bd = bodyBuf.getChannelData(0);
-    for (let i = 0; i < bd.length; i++) bd[i] = Math.random() * 2 - 1;
-    const bodyNoise = ctx.createBufferSource(); bodyNoise.buffer = bodyBuf;
-    const bodyFilt  = ctx.createBiquadFilter();
-    bodyFilt.type   = 'bandpass'; bodyFilt.frequency.value = baseFreq * 0.75; bodyFilt.Q.value = 2.2;
-    const bodyGain  = ctx.createGain();
-    bodyGain.gain.setValueAtTime(vel * 1.7, now);
-    bodyGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.65);
-    bodyNoise.connect(bodyFilt); bodyFilt.connect(bodyGain); bodyGain.connect(output);
-    bodyNoise.start(now); bodyNoise.stop(now + 0.7);
-    const skinBuf = ctx.createBuffer(1, Math.floor(sr * 0.06), sr);
-    const sd = skinBuf.getChannelData(0);
-    for (let i = 0; i < sd.length; i++) sd[i] = Math.random() * 2 - 1;
-    const skinNoise = ctx.createBufferSource(); skinNoise.buffer = skinBuf;
-    const skinFilt  = ctx.createBiquadFilter();
-    skinFilt.type   = 'bandpass'; skinFilt.frequency.value = baseFreq * 5.5; skinFilt.Q.value = 0.9;
-    const skinGain  = ctx.createGain();
-    skinGain.gain.setValueAtTime(vel * 0.9, now);
-    skinGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.045);
-    skinNoise.connect(skinFilt); skinFilt.connect(skinGain); skinGain.connect(output);
-    skinNoise.start(now); skinNoise.stop(now + 0.065);
-    const toneOsc = ctx.createOscillator(); toneOsc.type = 'sine';
-    toneOsc.frequency.setValueAtTime(baseFreq * 1.4, now);
-    toneOsc.frequency.exponentialRampToValueAtTime(baseFreq * 0.55, now + 0.28);
-    const toneGain = ctx.createGain();
-    toneGain.gain.setValueAtTime(vel * 0.45, now);
-    toneGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
-    toneOsc.connect(toneGain); toneGain.connect(output);
-    toneOsc.start(now); toneOsc.stop(now + 0.35);
+  // ─── ディストーション波形カーブ ───
+  function makeDistortionCurve(amount = 50) {
+    const n = 4096;
+    const curve = new Float32Array(n);
+    const k = amount;
+    for (let i = 0; i < n; i++) {
+      const x = (i * 2) / n - 1;
+      curve[i] = ((Math.PI + k) * x) / (Math.PI + k * Math.abs(x));
+    }
+    return curve;
   }
 
-  // 小鼓 (kotsuzumi) — 胴鳴り「ポン」音
-  function hitKotsuzumi(ctx, output, freq, vel) {
-    const now = ctx.currentTime;
+  // ─── Karplus-Strong プラック弦合成 ───
+  function pluckBuffer(ctx, freq, duration = 1.6, decay = 0.997) {
     const sr  = ctx.sampleRate;
-    const nb = ctx.createBuffer(1, Math.floor(sr * 0.25), sr);
-    const nd = nb.getChannelData(0);
-    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
-    const ns = ctx.createBufferSource(); ns.buffer = nb;
-    const f  = ctx.createBiquadFilter();
-    f.type   = 'bandpass'; f.frequency.value = freq * 2.2; f.Q.value = 5.0;
-    const g  = ctx.createGain();
-    g.gain.setValueAtTime(vel * 1.3, now);
-    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.20);
-    ns.connect(f); f.connect(g); g.connect(output);
-    ns.start(now); ns.stop(now + 0.22);
-    const osc = ctx.createOscillator(); osc.type = 'sine';
-    osc.frequency.setValueAtTime(freq * 3.8, now);
-    osc.frequency.exponentialRampToValueAtTime(freq * 1.6, now + 0.14);
-    const og = ctx.createGain();
-    og.gain.setValueAtTime(vel * 0.60, now);
-    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
-    osc.connect(og); og.connect(output);
-    osc.start(now); osc.stop(now + 0.18);
+    const len = Math.floor(sr * duration);
+    const N   = Math.max(2, Math.floor(sr / freq));
+    const buf = ctx.createBuffer(1, len, sr);
+    const out = buf.getChannelData(0);
+    const ring = new Float32Array(N);
+    for (let i = 0; i < N; i++) ring[i] = (Math.random() * 2 - 1);
+    let p = 0;
+    for (let i = 0; i < len; i++) {
+      const cur = ring[p];
+      const nxt = ring[(p + 1) % N];
+      out[i]   = cur;
+      ring[p]  = (cur + nxt) * 0.5 * decay;
+      p = (p + 1) % N;
+    }
+    return buf;
   }
 
-  // 締太鼓 (shime-daiko) — タイトな高域打音
-  function hitShimeDaiko(ctx, output, freq, vel) {
-    const now = ctx.currentTime;
-    const sr  = ctx.sampleRate;
-    const nb = ctx.createBuffer(1, Math.floor(sr * 0.10), sr);
-    const nd = nb.getChannelData(0);
-    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
-    const ns = ctx.createBufferSource(); ns.buffer = nb;
-    const f  = ctx.createBiquadFilter();
-    f.type   = 'bandpass'; f.frequency.value = freq * 4.0; f.Q.value = 3.5;
-    const g  = ctx.createGain();
-    g.gain.setValueAtTime(vel * 1.8, now);
-    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
-    ns.connect(f); f.connect(g); g.connect(output);
-    ns.start(now); ns.stop(now + 0.10);
-    const osc = ctx.createOscillator(); osc.type = 'sine';
-    osc.frequency.setValueAtTime(freq * 5.5, now);
-    osc.frequency.exponentialRampToValueAtTime(freq * 2.2, now + 0.06);
-    const og = ctx.createGain();
-    og.gain.setValueAtTime(vel * 0.70, now);
-    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
-    osc.connect(og); og.connect(output);
-    osc.start(now); osc.stop(now + 0.09);
-  }
-
-  // 鈴 (suzu) — 揺れる鈴（デチューンしたサイン波クラスター）
-  function hitSuzu(ctx, output, baseFreq, vel) {
-    const now   = ctx.currentTime;
-    const parts = [
-      { f: baseFreq,         amp: 0.32, dec: 0.55 },
-      { f: baseFreq * 1.005, amp: 0.25, dec: 0.48 },
-      { f: baseFreq * 0.997, amp: 0.22, dec: 0.52 },
-      { f: baseFreq * 2.010, amp: 0.18, dec: 0.38 },
-      { f: baseFreq * 2.008, amp: 0.14, dec: 0.32 },
-      { f: baseFreq * 3.012, amp: 0.09, dec: 0.25 },
+  // ─── ギター単音 (3声トリプルトラッキング: L/C/R デチューン) ───
+  function pickGuitar(ctx, amps, freq, vel, dur = 1.0) {
+    const voices = [
+      { detune: 0.997, delay: 0.012, gain: 0.55, ampIdx: 0 },  // L
+      { detune: 1.000, delay: 0.000, gain: 0.65, ampIdx: 1 },  // C
+      { detune: 1.003, delay: 0.020, gain: 0.55, ampIdx: 2 },  // R
     ];
-    parts.forEach(({ f, amp, dec }, i) => {
-      const osc = ctx.createOscillator(); osc.type = 'sine';
-      osc.frequency.value = f;
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(vel * amp, now + i * 0.007);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + dec);
-      osc.connect(g); g.connect(output);
-      osc.start(now + i * 0.007); osc.stop(now + dec + 0.05);
+    voices.forEach((v) => {
+      const start = ctx.currentTime + v.delay;
+      const buf   = pluckBuffer(ctx, freq * v.detune, dur, 0.996);
+      const src   = ctx.createBufferSource(); src.buffer = buf;
+      const env   = ctx.createGain();
+      env.gain.setValueAtTime(0, start);
+      env.gain.linearRampToValueAtTime(vel * v.gain, start + 0.005);
+      env.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      src.connect(env); env.connect(amps[v.ampIdx].inp);
+      src.start(start); src.stop(start + dur + 0.05);
     });
   }
 
-  // 鉦連打 (チンチキチン pattern) — チン・チキ・チン
-  function hitKaneBurst(ctx, output, baseFreq, vel) {
-    const timings = [0, 105, 185, 330];
-    const vels    = [1.0, 0.45, 0.42, 0.88];
-    timings.forEach((ms, i) => {
-      setTimeout(() => {
-        if (!ctx) return;
-        hitKane(ctx, output, baseFreq * (1 + (Math.random() - 0.5) * 0.03), vel * vels[i]);
-      }, ms);
-    });
+  // ─── ギターアンプチャンネル (L/C/R 別々の歪みチェーン) ───
+  function makeGuitarAmp(ctx, panValue, distortAmount) {
+    const inp  = ctx.createGain(); inp.gain.value = 1.0;
+    const dist = ctx.createWaveShaper();
+    dist.curve = makeDistortionCurve(distortAmount);
+    dist.oversample = '4x';
+    const tone = ctx.createBiquadFilter();
+    tone.type  = 'lowpass'; tone.frequency.value = 2800; tone.Q.value = 0.8;
+    const pan  = ctx.createStereoPanner(); pan.pan.value = panValue;
+    inp.connect(dist); dist.connect(tone); tone.connect(pan);
+    return { inp, dist, tone, pan };
   }
 
-  // 笛 ─ ブレスノイズ + ビブラート付きサイン
-  function createFue(ctx, output) {
+  // ─── ベースノート ───
+  function playBass(ctx, ampInput, freq, vel, dur = 0.5) {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type  = 'sawtooth'; osc.frequency.value = freq;
+    const sub = ctx.createOscillator();
+    sub.type  = 'sine'; sub.frequency.value = freq * 0.5;
+    const lp  = ctx.createBiquadFilter();
+    lp.type   = 'lowpass'; lp.Q.value = 2.5;
+    lp.frequency.setValueAtTime(freq * 7, now);
+    lp.frequency.exponentialRampToValueAtTime(freq * 2.4, now + dur * 0.5);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0, now);
+    env.gain.linearRampToValueAtTime(vel * 0.55, now + 0.006);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    const subEnv = ctx.createGain();
+    subEnv.gain.setValueAtTime(0, now);
+    subEnv.gain.linearRampToValueAtTime(vel * 0.30, now + 0.008);
+    subEnv.gain.exponentialRampToValueAtTime(0.0001, now + dur * 0.9);
+    osc.connect(lp); lp.connect(env); env.connect(ampInput);
+    sub.connect(subEnv); subEnv.connect(ampInput);
+    osc.start(now); osc.stop(now + dur + 0.05);
+    sub.start(now); sub.stop(now + dur + 0.05);
+  }
+
+  // ─── キックドラム ───
+  function hitKick(ctx, output, vel) {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type  = 'sine';
+    osc.frequency.setValueAtTime(120, now);
+    osc.frequency.exponentialRampToValueAtTime(38, now + 0.09);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(vel * 1.2, now);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
+    osc.connect(env); env.connect(output);
+    osc.start(now); osc.stop(now + 0.45);
+  }
+
+  // ─── スネア ───
+  function hitSnare(ctx, output, vel) {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type  = 'triangle';
+    osc.frequency.setValueAtTime(220, now);
+    osc.frequency.exponentialRampToValueAtTime(140, now + 0.08);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(vel * 0.45, now);
+    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.13);
+    osc.connect(og); og.connect(output);
+    osc.start(now); osc.stop(now + 0.15);
+    const sr = ctx.sampleRate;
+    const nb = ctx.createBuffer(1, Math.floor(sr * 0.18), sr);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns = ctx.createBufferSource(); ns.buffer = nb;
+    const nf = ctx.createBiquadFilter(); nf.type = 'highpass'; nf.frequency.value = 850;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.85, now);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+    ns.connect(nf); nf.connect(ng); ng.connect(output);
+    ns.start(now); ns.stop(now + 0.18);
+  }
+
+  // ─── ハイハット ───
+  function hitHihat(ctx, output, vel, open = false) {
+    const now = ctx.currentTime;
     const sr  = ctx.sampleRate;
-    const len = Math.floor(sr * 4);
-    const nBuf = ctx.createBuffer(1, len, sr);
-    const nd   = nBuf.getChannelData(0);
-    for (let i = 0; i < len; i++) nd[i] = Math.random() * 2 - 1;
-    const noiseNode  = ctx.createBufferSource();
-    noiseNode.buffer = nBuf; noiseNode.loop = true;
-    const breathFilt = ctx.createBiquadFilter();
-    breathFilt.type  = 'bandpass';
-    breathFilt.frequency.value = 1400;
-    breathFilt.Q.value = 3.5;
-    const breathGain = ctx.createGain();
-    breathGain.gain.value = 0.07;
-    noiseNode.connect(breathFilt); breathFilt.connect(breathGain); breathGain.connect(output);
-    noiseNode.start();
-    const fueOsc = ctx.createOscillator();
-    fueOsc.type  = 'sine';
-    fueOsc.frequency.value = 523.25;
-    const vibLFO   = ctx.createOscillator();
-    vibLFO.type    = 'sine';
-    vibLFO.frequency.value = 5.2;
-    const vibGain  = ctx.createGain();
-    vibGain.gain.value = 6;
-    vibLFO.connect(vibGain); vibGain.connect(fueOsc.frequency);
-    const fueGain  = ctx.createGain();
-    fueGain.gain.value = 0.09;
-    fueOsc.connect(fueGain); fueGain.connect(output);
-    fueOsc.start(); vibLFO.start();
-    return { breathFilt, breathGain, fueOsc, vibLFO, vibGain, fueGain };
+    const dur = open ? 0.24 : 0.045;
+    const nb  = ctx.createBuffer(1, Math.floor(sr * dur), sr);
+    const nd  = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns  = ctx.createBufferSource(); ns.buffer = nb;
+    const nf  = ctx.createBiquadFilter();
+    nf.type = 'highpass'; nf.frequency.value = 7200;
+    const nf2 = ctx.createBiquadFilter();
+    nf2.type = 'bandpass'; nf2.frequency.value = 9500; nf2.Q.value = 0.5;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.42, now);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    ns.connect(nf); nf.connect(nf2); nf2.connect(ng); ng.connect(output);
+    ns.start(now); ns.stop(now + dur + 0.01);
   }
 
-  // 鉦（非調和倍音）vel = 音量倍率（デフォルト 1.0）
-  function hitKane(ctx, output, baseFreq, vel = 1.0) {
-    const now    = ctx.currentTime;
-    const ratios = [1, 2.76, 5.40, 8.93];
-    const amps   = [1.0, 0.55, 0.28, 0.14];
-    const decays = [2.5, 1.8, 1.2, 0.8];
-    ratios.forEach((r, i) => {
-      const osc = ctx.createOscillator();
-      osc.type  = 'sine';
-      osc.frequency.value = baseFreq * r;
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(amps[i] * 0.25 * vel, now);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + decays[i]);
-      osc.connect(g); g.connect(output);
-      osc.start(now); osc.stop(now + decays[i] + 0.1);
-    });
+  // ─── クラッシュシンバル ───
+  function hitCrash(ctx, output, vel) {
+    const now = ctx.currentTime;
+    const sr  = ctx.sampleRate;
+    const dur = 1.7;
+    const nb  = ctx.createBuffer(1, Math.floor(sr * dur), sr);
+    const nd  = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns  = ctx.createBufferSource(); ns.buffer = nb;
+    const nf  = ctx.createBiquadFilter();
+    nf.type = 'highpass'; nf.frequency.value = 4000;
+    const ng  = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.55, now);
+    ng.gain.exponentialRampToValueAtTime(0.06, now + 0.06);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    ns.connect(nf); nf.connect(ng); ng.connect(output);
+    ns.start(now); ns.stop(now + dur + 0.02);
   }
 
   // ============================================================
@@ -560,201 +603,238 @@
     audienceReverb.connect(reverbReturnGain);
     reverbReturnGain.connect(audienceMaster);
 
-    // ─── アンビエントパッド（6声、四七抜き倍音を重ねる） ───
-    const aidx = parseInt(socket.id.slice(-4), 16) % 3;
-    // 四七抜き音階に基づく 6声和音（低音＋中音＋上方倍音）
-    const chords = [
-      [196.00, 293.66, 392.00, 440.00, 587.33, 784.00],  // G3, D4, G4, A4, D5, G5
-      [220.00, 329.63, 440.00, 523.25, 659.26, 880.00],  // A3, E4, A4, C5, E5, A5
-      [146.83, 220.00, 293.66, 392.00, 440.00, 587.33],  // D3, A3, D4, G4, A4, D5
+    // ─── ギターアンプ 3チャンネル (L/C/R) — Oasis クランチ感 ───
+    const guitarAmps = [
+      makeGuitarAmp(audienceCtx, -0.7, 22),
+      makeGuitarAmp(audienceCtx,  0.0, 28),
+      makeGuitarAmp(audienceCtx,  0.7, 22),
     ];
-    const freqs = chords[aidx];
+    const guitarBus = audienceCtx.createGain(); guitarBus.gain.value = 0.42;
+    guitarAmps.forEach(a => a.pan.connect(guitarBus));
+    guitarBus.connect(audienceReverb);
 
+    // ─── ベースアンプチェーン ───
+    const bassAmp = audienceCtx.createGain(); bassAmp.gain.value = 1.0;
+    const bassToneFilt = audienceCtx.createBiquadFilter();
+    bassToneFilt.type = 'lowpass';
+    bassToneFilt.frequency.value = 750;
+    bassToneFilt.Q.value = 1.0;
+    const bassBus = audienceCtx.createGain(); bassBus.gain.value = 0.55;
+    bassAmp.connect(bassToneFilt);
+    bassToneFilt.connect(bassBus);
+    const bassDuck = audienceCtx.createGain(); bassDuck.gain.value = 1.0;
+    bassBus.connect(bassDuck);
+    bassDuck.connect(audienceComp);
+
+    // ─── ドラムバス ───
+    const drumBus = audienceCtx.createGain(); drumBus.gain.value = 0.55;
+    drumBus.connect(audienceComp);
+
+    // ─── サイドチェイン用 ダックゲイン (キックで一瞬下がる) ───
+    const padDuck = audienceCtx.createGain(); padDuck.gain.value = 1.0;
+    function duckSidechain(amount = 0.45, recoverMs = 200) {
+      if (!audienceCtx) return;
+      const t = audienceCtx.currentTime;
+      [padDuck, bassDuck].forEach((g) => {
+        g.gain.cancelScheduledValues(t);
+        g.gain.setValueAtTime(g.gain.value, t);
+        g.gain.linearRampToValueAtTime(amount, t + 0.010);
+        g.gain.linearRampToValueAtTime(1.0,    t + recoverMs / 1000);
+      });
+    }
+
+    // ─── 持続するコードパッド (進行に合わせて 4音をスムーズに移動) ───
+    // padBus → padDuck (サイドチェイン) → 3 アンプチャンネル(分散送り)
     padBus = audienceCtx.createGain();
     padBus.gain.setValueAtTime(0, audienceCtx.currentTime);
-    padBus.gain.linearRampToValueAtTime(0.13, audienceCtx.currentTime + 3.5);
-    padBus.connect(audienceReverb);
+    padBus.gain.linearRampToValueAtTime(0.16, audienceCtx.currentTime + 4.0);
+    padBus.connect(padDuck);
+    guitarAmps.forEach(a => padDuck.connect(a.inp));
 
-    freqs.forEach((f, i) => {
+    // 4声の sustained osc (root, 3rd, 5th, oct) — コード変化で周波数を ramp
+    // 初期値は G コード
+    const padOscs = [];
+    const padDetunes = [0.997, 1.000, 1.003, 1.000];   // 互い違いのデチューン
+    const padGains   = [0.32, 0.30, 0.30, 0.18];
+    const padTypes   = ['sawtooth', 'sawtooth', 'sawtooth', 'triangle'];
+    for (let i = 0; i < 4; i++) {
       const osc = audienceCtx.createOscillator();
-      // 下3声は sine、上3声は triangle（倍音豊かで広がり感）
-      osc.type  = i < 3 ? 'sine' : 'triangle';
-      osc.frequency.value = f;
+      osc.type  = padTypes[i];
+      osc.frequency.value = CHORDS.G.voicing[i] * padDetunes[i];
+      const g   = audienceCtx.createGain(); g.gain.value = padGains[i];
+      osc.connect(g); g.connect(padBus);
+      osc.start();
+      padOscs.push(osc);
 
-      // ゆっくりした振幅変調（各声で異なる周期）
-      const modOsc   = audienceCtx.createOscillator();
-      modOsc.type    = 'sine';
-      modOsc.frequency.value = 0.015 + i * 0.011;
-      const modDepth = audienceCtx.createGain();
-      modDepth.gain.value = 0.18;
+      // ゆっくり LFO で揺らぎ
+      const lfo = audienceCtx.createOscillator(); lfo.type = 'sine';
+      lfo.frequency.value = 0.06 + i * 0.04;
+      const dep = audienceCtx.createGain(); dep.gain.value = 0.04;
+      lfo.connect(dep); dep.connect(g.gain);
+      lfo.start();
+    }
 
-      const oscGain  = audienceCtx.createGain();
-      // 上の声ほど小さめ
-      oscGain.gain.value = (0.90 - i * 0.08) / freqs.length;
+    // ─── コード進行タイマー (3秒ごとに次のコードへ ramp) ───
+    let chordIdx = 0;
+    let currentChord = CHORDS[_activeProgression[0]];
+    function rampPadToChord(chord) {
+      const t = audienceCtx.currentTime;
+      padOscs.forEach((osc, i) => {
+        const target = chord.voicing[i] * padDetunes[i];
+        osc.frequency.linearRampToValueAtTime(target, t + 1.2);
+      });
+    }
+    function nextChord() {
+      chordIdx = (chordIdx + 1) % _activeProgression.length;
+      currentChord = CHORDS[_activeProgression[chordIdx]];
+      rampPadToChord(currentChord);
+    }
+    setInterval(nextChord, 3200);
 
-      modOsc.connect(modDepth);
-      modDepth.connect(oscGain.gain);
-      osc.connect(oscGain);
-      oscGain.connect(padBus);
-      osc.start(); modOsc.start();
-    });
-
-    // 環境ノイズテクスチャ（薄いざわめき）
+    // ─── 環境ノイズ (アンプヒス) ───
     const envBuf = audienceCtx.createBuffer(1, audienceCtx.sampleRate * 4, audienceCtx.sampleRate);
     const ed = envBuf.getChannelData(0);
     for (let i = 0; i < ed.length; i++) ed[i] = Math.random() * 2 - 1;
     const envSrc  = audienceCtx.createBufferSource();
     envSrc.buffer = envBuf; envSrc.loop = true;
     const envFilt = audienceCtx.createBiquadFilter();
-    envFilt.type  = 'bandpass'; envFilt.frequency.value = 600; envFilt.Q.value = 1.0;
-    const envGain = audienceCtx.createGain(); envGain.gain.value = 0.04;
+    envFilt.type  = 'bandpass'; envFilt.frequency.value = 1800; envFilt.Q.value = 0.7;
+    const envGain = audienceCtx.createGain(); envGain.gain.value = 0.022;
     envSrc.connect(envFilt); envFilt.connect(envGain); envGain.connect(audienceReverb);
     envSrc.start();
 
-    // ─── 笛アンビエントテクスチャ ───
-    const audFueObj = createFue(audienceCtx, audienceReverb);
-    audFueObj.fueGain.gain.value   = 0.08;
-    audFueObj.breathGain.gain.value = 0.04;
-    audFueObj.vibGain.gain.value   = 6;
+    // ─── サブベースドローン (G1 = 49Hz、曲切替で他の音にも変化) ───
+    const droneOsc = audienceCtx.createOscillator();
+    droneOsc.type  = 'triangle';
+    droneOsc.frequency.value = 49.00;
+    const droneGain = audienceCtx.createGain(); droneGain.gain.value = 0.08;
+    droneOsc.connect(droneGain); droneGain.connect(bassAmp);
+    droneOsc.start();
 
-    // 笛の自律的音符進行（ゆっくり漂う）
-    let audFueIdx = 7;
-    function advanceAudFue() {
-      if (!audienceCtx) return;
-      const move = Math.min(world.totalMovement / 4, 1);
-      if (Math.random() < 0.45 + move * 0.30) {
-        audFueIdx += Math.random() < 0.55 ? 1 : -1;
-        audFueIdx  = Math.max(5, Math.min(YO.length - 1, audFueIdx));
-      }
-      const t = audienceCtx.currentTime;
-      audFueObj.fueOsc.frequency.linearRampToValueAtTime(YO[audFueIdx], t + 0.5);
-      audFueObj.breathFilt.frequency.linearRampToValueAtTime(YO[audFueIdx] * 2.1, t + 0.3);
-      // 担ぎ手がいないときはゆっくり動く
-      const ms = world.mikoshiCount > 0
-        ? 450 + Math.random() * 1000 + (1 - move) * 700
-        : 1500 + Math.random() * 2000;
-      setTimeout(advanceAudFue, ms);
+    // ─── 曲切替: 進行 / 歪み量 / トニックドローン更新 + パッドを頭に戻す ───
+    function applySong(idx) {
+      const song = SONGS[idx];
+      _activeSongIdx     = idx;
+      _activeProgression = song.progression;
+      _activeDrive       = song.drive;
+      const offs = [-3, 0, -3];
+      guitarAmps.forEach((amp, i) => {
+        amp.dist.curve = makeDistortionCurve(song.drive + offs[i]);
+      });
+      droneOsc.frequency.linearRampToValueAtTime(song.tonic, audienceCtx.currentTime + 1.2);
+      chordIdx = 0;
+      currentChord = CHORDS[song.progression[0]];
+      rampPadToChord(currentChord);
+      console.log('[song]', idx, song.name);
     }
-    advanceAudFue();
+    applySong(0);
+    setInterval(() => {
+      applySong((_activeSongIdx + 1) % SONGS.length);
+    }, SONG_DURATION_MS);
 
-    // 第2笛（ハーモニー）
-    const audFue2Obj = createFue(audienceCtx, audienceReverb);
-    audFue2Obj.fueGain.gain.value    = 0.05;
-    audFue2Obj.breathGain.gain.value = 0.025;
-    audFue2Obj.fueOsc.frequency.value = YO[Math.min(audFueIdx + 3, YO.length - 1)];
-
-    // ─── 鉦ループ（複数の鉦が異なるタイミングで鳴る）───
-    const kaneFreqSet = [146.83, 196.00, 220.00, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33];
-    let kaneBeat = 0;
-    function ringBells() {
+    // ─── ドラムループ (担ぎ手がいるとき疎にビート) ───
+    let drumBeat = 0;
+    function drumLoop() {
       if (!audienceCtx) return;
       const energy = world.avgAudienceEnergy || 0;
       const move   = Math.min(world.totalMovement / 4, 1);
-      const gap    = world.mikoshiCount > 0
-        ? Math.max(200, 800 - energy * 550 - move * 180) + Math.random() * 700
-        : 2800 + Math.random() * 2200;
 
-      setTimeout(() => {
-        if (world.mikoshiCount > 0 && audienceCtx) {
-          kaneBeat++;
-          const vel = 0.52 + energy * 0.48;
-
-          // 鉦 1音目
-          const bf1 = kaneFreqSet[Math.floor(Math.random() * kaneFreqSet.length)];
-          hitKane(audienceCtx, audienceReverb, bf1 * (0.88 + world.avgColorTemp * 0.24), vel);
-
-          // 鉦 2音目（少し遅れて重ねる）
-          if (Math.random() < 0.60) {
-            setTimeout(() => {
-              const bf2 = kaneFreqSet[Math.floor(Math.random() * kaneFreqSet.length)];
-              hitKane(audienceCtx, audienceReverb, bf2, vel * 0.62);
-            }, 130 + Math.random() * 180 | 0);
-          }
-
-          // 鈴（盛り上がり時）
-          if (energy > 0.40 && Math.random() < 0.42) {
-            setTimeout(() => hitSuzu(audienceCtx, audienceReverb, 523.25, vel * 0.42), 70);
-          }
-
-          // 鉦連打 チンチキチン: 4拍ごと
-          if (kaneBeat % 4 === 0) {
-            setTimeout(() => hitKaneBurst(audienceCtx, audienceReverb,
-              kaneFreqSet[Math.floor(Math.random() * kaneFreqSet.length)], vel * 0.55), 280);
-          }
-
-          // 観客がとても盛り上がったら3音同時
-          if (energy > 0.65 && Math.random() < 0.35) {
-            setTimeout(() => {
-              const bf3 = kaneFreqSet[Math.floor(Math.random() * kaneFreqSet.length)];
-              hitKane(audienceCtx, audienceReverb, bf3, vel * 0.45);
-            }, 240 + Math.random() * 160 | 0);
-          }
-        }
-        ringBells();
-      }, gap);
-    }
-    ringBells();
-
-    // 追加の鉦ループ（低い周波数帯、別テンポ）
-    function ringDeepBell() {
-      if (!audienceCtx) return;
-      const energy = world.avgAudienceEnergy || 0;
-      const gap = world.mikoshiCount > 0
-        ? Math.max(500, 1800 - energy * 900) + Math.random() * 1200
-        : 5000 + Math.random() * 3000;
-      setTimeout(() => {
-        if (world.mikoshiCount > 0 && audienceCtx) {
-          const lowFreqs = [73.42, 82.41, 98.00, 110.00, 146.83];
-          const bf = lowFreqs[Math.floor(Math.random() * lowFreqs.length)];
-          hitKane(audienceCtx, audienceReverb, bf, 0.45 + energy * 0.35);
-        }
-        ringDeepBell();
-      }, gap);
-    }
-    ringDeepBell();
-
-    // ─── 打楽器アンビエントループ ───
-    // 太鼓・小鼓・締太鼓が散発的に聴こえる（神輿の響きが会場に届く感覚）
-    const percBaseFreq = freqs[0] * 0.5;  // pad の基音と揃える
-    function percLoop() {
-      if (!audienceCtx) return;
-      const energy = world.avgAudienceEnergy || 0;
-      const move   = Math.min(world.totalMovement / 4, 1);
-      const vel    = 0.10 + move * 0.25 + energy * 0.15;
-
+      // 担ぎ手が居ない時はスローパルス。居る時は普通のロックビート (4/4 を遅め)
       if (world.mikoshiCount > 0) {
-        // 太鼓
-        if (Math.random() < 0.62) {
-          hitTaiko(audienceCtx, audienceComp, percBaseFreq, vel * 0.75);
+        drumBeat++;
+        const vel = 0.32 + energy * 0.45 + move * 0.20;
+
+        // キック (アタマ) + サイドチェイン発火
+        hitKick(audienceCtx, drumBus, vel * 0.85);
+        duckSidechain();
+
+        // バックビート (2拍目)
+        const beatMs = world.mikoshiCount > 0 ? Math.max(220, 600 - energy * 200 - move * 100) : 1200;
+        setTimeout(() => hitSnare(audienceCtx, drumBus, vel * 0.7), beatMs | 0);
+
+        // ハイハット 8分
+        for (let s = 0; s < 4; s++) {
+          setTimeout(() => hitHihat(audienceCtx, drumBus, vel * 0.45), (beatMs * s / 2) | 0);
         }
-        // 小鼓（遅れて）
-        if (Math.random() < 0.55) {
-          setTimeout(() => hitKotsuzumi(audienceCtx, audienceComp, percBaseFreq * 2.5, vel * 0.58),
-                     (180 + Math.random() * 220) | 0);
+
+        // クラッシュ: 4拍周期
+        if (drumBeat % 4 === 0 && Math.random() < 0.55) {
+          hitCrash(audienceCtx, drumBus, vel * 0.5);
         }
-        // 締太鼓フィル
-        if (Math.random() < 0.42) {
-          setTimeout(() => hitShimeDaiko(audienceCtx, audienceComp, percBaseFreq, vel * 0.52),
-                     (380 + Math.random() * 300) | 0);
+
+        // 終端で力強い盛り上がり時のフィル
+        if (energy > 0.55 && Math.random() < 0.30) {
+          setTimeout(() => hitSnare(audienceCtx, drumBus, vel * 0.5), beatMs * 1.6 | 0);
         }
-        // 鈴（盛り上がり時）
-        if (energy > 0.35 && Math.random() < 0.38) {
-          setTimeout(() => hitSuzu(audienceCtx, audienceComp, 440, vel * 0.38),
-                     (90 + Math.random() * 140) | 0);
+
+        const gap = beatMs * 2 + Math.random() * 200;
+        setTimeout(drumLoop, gap | 0);
+      } else {
+        // 担ぎ手なし: 静かに散発キック
+        if (Math.random() < 0.25) {
+          hitKick(audienceCtx, drumBus, 0.20);
+          duckSidechain(0.65, 220);   // 軽めのダック
         }
-        // 小鼓 2発目（より密に）
-        if (move > 0.5 && Math.random() < 0.48) {
-          setTimeout(() => hitKotsuzumi(audienceCtx, audienceComp, percBaseFreq * 2.5, vel * 0.42),
-                     (550 + Math.random() * 200) | 0);
+        setTimeout(drumLoop, 4000 + Math.random() * 3000);
+      }
+    }
+    drumLoop();
+
+    // ─── ベースライン (現在コードの bassNotes を順に踏む) ───
+    let bassStep = 0;
+    function bassLoop() {
+      if (!audienceCtx) return;
+      const energy = world.avgAudienceEnergy || 0;
+      if (world.mikoshiCount > 0) {
+        const move = Math.min(world.totalMovement / 4, 1);
+        const vel  = 0.30 + energy * 0.30 + move * 0.20;
+        const notes = currentChord.bassNotes;
+        const f = notes[bassStep % notes.length];
+        bassStep++;
+        playBass(audienceCtx, bassAmp, f, vel, 0.40);
+        const gap = Math.max(220, 520 - energy * 160 - move * 100) + Math.random() * 180;
+        setTimeout(bassLoop, gap | 0);
+      } else {
+        setTimeout(bassLoop, 2800);
+      }
+    }
+    bassLoop();
+
+    // ─── ギターリード(コードトーンに寄り添う、フレーズで休符を入れる) ───
+    let leadStep = 0;
+    let leadPhraseRemaining = 0;
+    function leadLoop() {
+      if (!audienceCtx) return;
+      const energy = world.avgAudienceEnergy || 0;
+      const move   = Math.min(world.totalMovement / 4, 1);
+
+      let isResting = false;
+      if (world.mikoshiCount > 0) {
+        if (leadPhraseRemaining <= 0) {
+          // 休符明け: 新フレーズ開始 (1〜3音)
+          leadPhraseRemaining = 1 + Math.floor(Math.random() * (1.5 + energy * 1.5));
+          leadStep = Math.floor(Math.random() * 3);   // コードトーンに着地
+        } else if (Math.random() < 0.7) {
+          leadStep += Math.random() < 0.55 ? 1 : -1;
+          leadStep = Math.max(0, Math.min(currentChord.lead.length - 1, leadStep));
         }
+        const f = currentChord.lead[leadStep];
+        const isLast = leadPhraseRemaining === 1;
+        const dur = isLast ? 1.2 + Math.random() * 0.6 : 0.5 + Math.random() * 0.3;
+        const vel = 0.30 + energy * 0.30;
+        pickGuitar(audienceCtx, guitarAmps, f, vel, dur);
+        leadPhraseRemaining--;
+        isResting = leadPhraseRemaining <= 0;
       }
 
       const gap = world.mikoshiCount > 0
-        ? Math.max(280, 650 - energy * 350 - move * 150) + Math.random() * 550
-        : 3500 + Math.random() * 2500;
-      setTimeout(percLoop, gap);
+        ? (isResting
+            ? 1400 + Math.random() * 1600        // フレーズ間の休符
+            : 320 + Math.random() * 280)         // フレーズ内
+        : 4500 + Math.random() * 3000;
+      setTimeout(leadLoop, gap | 0);
     }
-    percLoop();
+    leadLoop();
 
     audioReady = true;
 
@@ -867,20 +947,18 @@
     const energy = Math.min(s.avgAudienceEnergy || 0, 1);
     const t      = audienceCtx.currentTime;
 
-    // 担ぎ手がいない場合はパッドをフェードダウン
+    // 担ぎ手がいない場合はパワーコードパッドをフェードダウン
     if (padBus) {
       const targetPad = s.mikoshiCount === 0
-        ? 0.04
-        : 0.10 + move * 0.08 + energy * 0.06;
+        ? 0.05
+        : 0.18 + move * 0.10 + energy * 0.08;
       padBus.gain.linearRampToValueAtTime(targetPad, t + 2.5);
     }
 
     // 観客エネルギーで全体音量が上がる
-    if (audienceMaster) {
-      audienceMaster.gain.linearRampToValueAtTime(
-        0.72 + energy * 0.18, t + 1.0
-      );
-    }
+    audienceMaster.gain.linearRampToValueAtTime(
+      0.72 + energy * 0.18, t + 1.0
+    );
   }
 
   function lerp(a, b, t) { return a + (b - a) * t; }

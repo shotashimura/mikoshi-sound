@@ -46,14 +46,70 @@
   'use strict';
 
   // ============================================================
-  //  四七抜き短音階 (D E G A C) の周波数テーブル
+  //  G メジャースケール + コード辞書 (Oasis アンセム仕様)
+  //  進行: G - D - Em - Cadd9 (I-V-vi-IV、Wonderwall 系)
+  //  各コードに voicing(ストローク用)・bassNotes(ベース歩き用)・lead(リード音域) を持たせる。
   // ============================================================
-  const YO = [
-    73.42, 82.41, 98.00, 110.00, 130.81,
-    146.83, 164.81, 196.00, 220.00, 261.63,
-    293.66, 329.63, 392.00, 440.00, 523.25,
-    587.33, 659.26, 784.00,
+  const G_MAJ = [
+     49.00,  55.00,  61.74,  65.41,  73.42,  82.41,  92.50,    // G1 A1 B1 C2 D2 E2 F#2
+     98.00, 110.00, 123.47, 130.81, 146.83, 164.81, 184.997,   // G2 A2 B2 C3 D3 E3 F#3
+    196.00, 220.00, 246.94, 261.63, 293.66, 329.63, 369.99,    // G3 A3 B3 C4 D4 E4 F#4
+    392.00, 440.00, 493.88, 523.25, 587.33, 659.26, 739.99,    // G4 A4 B4 C5 D5 E5 F#5
+    783.99, 880.00, 987.77, 1046.50, 1174.66, 1318.51, 1479.98,// G5 A5 B5 C6 D6 E6 F#6
   ];
+
+  const CHORDS = {
+    G: {
+      bassNotes: [49.00, 73.42, 98.00, 123.47],
+      voicing:   [196.00, 246.94, 293.66, 392.00, 493.88],
+      lead:      [329.63, 392.00, 440.00, 493.88, 587.33, 659.26],
+    },
+    D: {
+      bassNotes: [73.42, 110.00, 146.83, 184.997],
+      voicing:   [146.83, 184.997, 220.00, 293.66, 369.99],
+      lead:      [369.99, 440.00, 493.88, 587.33, 659.26, 739.99],
+    },
+    Em: {
+      bassNotes: [82.41, 123.47, 164.81, 196.00],
+      voicing:   [164.81, 196.00, 246.94, 329.63, 392.00],
+      lead:      [329.63, 392.00, 440.00, 493.88, 587.33, 659.26],
+    },
+    Cadd9: {
+      bassNotes: [65.41, 98.00, 130.81, 164.81],
+      voicing:   [130.81, 164.81, 196.00, 261.63, 293.66],
+      lead:      [329.63, 392.00, 440.00, 493.88, 523.25, 659.26],
+    },
+    Am: {
+      bassNotes: [55.00, 82.41, 110.00, 130.81],                 // A1 E2 A2 C3
+      voicing:   [110.00, 130.81, 164.81, 220.00, 261.63],       // A2 C3 E3 A3 C4
+      lead:      [329.63, 392.00, 440.00, 493.88, 523.25, 659.26], // E4 G4 A4 B4 C5 E5
+    },
+    F: {
+      bassNotes: [43.65, 65.41, 87.31, 110.00],                  // F1 C2 F2 A2
+      voicing:   [87.31, 130.81, 174.61, 220.00, 261.63],        // F2 C3 F3 A3 C4
+      lead:      [349.23, 440.00, 523.25, 587.33, 659.26, 698.46], // F4 A4 C5 D5 E5 F5
+    },
+    C: {
+      bassNotes: [65.41, 98.00, 130.81, 164.81],
+      voicing:   [130.81, 164.81, 196.00, 261.63, 329.63],
+      lead:      [329.63, 392.00, 440.00, 493.88, 523.25, 659.26],
+    },
+  };
+
+  // ─── SONGS: 4 曲を 3:30 ごとに循環 (Oasis アンセム集) ───
+  const SONGS = [
+    { name: 'Wonderwall',     progression: ['G','D','Em','Cadd9'], tonic: 49.00, bpmBase:  87, drive: 28 },
+    { name: 'Live Forever',   progression: ['G','D','Am','C'],     tonic: 49.00, bpmBase: 110, drive: 35 },
+    { name: 'Anger',          progression: ['C','G','Am','F'],     tonic: 65.41, bpmBase:  82, drive: 22 },
+    { name: 'RocknRoll Star', progression: ['G','F','G','F'],      tonic: 49.00, bpmBase: 120, drive: 45 },
+  ];
+  const SONG_DURATION_MS = 210000;   // 3:30 per song
+
+  // ─── 現在再生中の曲の状態 (各端末ローカル、サーバー同期なし) ───
+  let _activeSongIdx     = 0;
+  let _activeProgression = SONGS[0].progression;
+  let _activeBpmBase     = SONGS[0].bpmBase;
+  let _activeDrive       = SONGS[0].drive;
 
   // ============================================================
   //  センサー状態
@@ -71,11 +127,24 @@
   let audioCtx     = null;
   let granularDest = null;  // MediaStreamDestinationNode → WebRTC audio track
   let granEngine   = null;  // GranularEngine instance
-  let fueObj       = null;  // fue oscillator refs
-  let fue2Obj      = null;  // 第2笛（ハーモニー）
-  let _audioRefs   = null;  // instrument bus refs for updateLoop
+  let _audioRefs   = null;  // instrument bus refs for updateLoop / sidechain
   let micAnalyser  = null;
   let micBuf       = null;
+
+  // ─── サイドチェインダッキング ───
+  // キックのタイミングで guitarDuck / bassDuck を一瞬下げて
+  // ロックフェスらしい「ドゥン!」のうねりを出す。
+  function duckSidechain(amount = 0.45, recoverMs = 180) {
+    if (!audioCtx || !_audioRefs) return;
+    const t = audioCtx.currentTime;
+    [_audioRefs.guitarDuck, _audioRefs.bassDuck, _audioRefs.padDuck].forEach((g) => {
+      if (!g) return;
+      g.gain.cancelScheduledValues(t);
+      g.gain.setValueAtTime(g.gain.value, t);
+      g.gain.linearRampToValueAtTime(amount, t + 0.010);
+      g.gain.linearRampToValueAtTime(1.0,    t + recoverMs / 1000);
+    });
+  }
 
   // ============================================================
   //  WebRTC: broadcaster（担ぎ手→観客へ映像＋グラニュラー音声）
@@ -536,7 +605,7 @@
   const tempoDetector = new TempoDetector();
 
   // ============================================================
-  //  Pillar 3: ピュア Web Audio API お囃子楽器
+  //  Pillar 3: ピュア Web Audio API ロックキット (ドラム・ベース・ギター)
   // ============================================================
 
   // 合成インパルスレスポンスによるコンボリューションリバーブ
@@ -555,309 +624,397 @@
     return conv;
   }
 
-  // 太鼓 ─ ノイズ帯域通過 + サインピッチ感
-  function hitTaiko(ctx, output, baseFreq, vel) {
-    const now = ctx.currentTime;
-    const sr  = ctx.sampleRate;
-
-    // 胴鳴り（低域バンドパスノイズ）
-    const bodyBuf = ctx.createBuffer(1, Math.floor(sr * 0.9), sr);
-    const bd = bodyBuf.getChannelData(0);
-    for (let i = 0; i < bd.length; i++) bd[i] = Math.random() * 2 - 1;
-    const bodyNoise = ctx.createBufferSource();
-    bodyNoise.buffer = bodyBuf;
-    const bodyFilt  = ctx.createBiquadFilter();
-    bodyFilt.type   = 'bandpass';
-    bodyFilt.frequency.value = baseFreq * 0.75;
-    bodyFilt.Q.value = 2.2;
-    const bodyGain = ctx.createGain();
-    bodyGain.gain.setValueAtTime(vel * 1.7, now);
-    bodyGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.65);
-    bodyNoise.connect(bodyFilt); bodyFilt.connect(bodyGain); bodyGain.connect(output);
-    bodyNoise.start(now); bodyNoise.stop(now + 0.7);
-
-    // 打面アタック（高域短ノイズ）
-    const skinBuf = ctx.createBuffer(1, Math.floor(sr * 0.06), sr);
-    const sd = skinBuf.getChannelData(0);
-    for (let i = 0; i < sd.length; i++) sd[i] = Math.random() * 2 - 1;
-    const skinNoise = ctx.createBufferSource();
-    skinNoise.buffer = skinBuf;
-    const skinFilt  = ctx.createBiquadFilter();
-    skinFilt.type   = 'bandpass';
-    skinFilt.frequency.value = baseFreq * 5.5;
-    skinFilt.Q.value = 0.9;
-    const skinGain = ctx.createGain();
-    skinGain.gain.setValueAtTime(vel * 0.9, now);
-    skinGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.045);
-    skinNoise.connect(skinFilt); skinFilt.connect(skinGain); skinGain.connect(output);
-    skinNoise.start(now); skinNoise.stop(now + 0.065);
-
-    // ピッチサイン（余韻感）
-    const toneOsc = ctx.createOscillator();
-    toneOsc.type = 'sine';
-    toneOsc.frequency.setValueAtTime(baseFreq * 1.4, now);
-    toneOsc.frequency.exponentialRampToValueAtTime(baseFreq * 0.55, now + 0.28);
-    const toneGain = ctx.createGain();
-    toneGain.gain.setValueAtTime(vel * 0.45, now);
-    toneGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
-    toneOsc.connect(toneGain); toneGain.connect(output);
-    toneOsc.start(now); toneOsc.stop(now + 0.35);
+  // ─── ディストーション波形カーブ ───
+  // amount が大きいほどクリップが強くなる（ファズ寄り）
+  function makeDistortionCurve(amount = 50) {
+    const n = 4096;
+    const curve = new Float32Array(n);
+    const k = amount;
+    for (let i = 0; i < n; i++) {
+      const x = (i * 2) / n - 1;
+      curve[i] = ((Math.PI + k) * x) / (Math.PI + k * Math.abs(x));
+    }
+    return curve;
   }
 
-  // 鉦 ─ 非調和倍音（金属感）
-  function hitKane(ctx, output, baseFreq) {
-    const now    = ctx.currentTime;
-    const ratios = [1, 2.76, 5.40, 8.93];
-    const amps   = [1.0, 0.55, 0.28, 0.14];
-    const decays = [2.5, 1.8, 1.2, 0.8];
-    ratios.forEach((r, i) => {
-      const osc = ctx.createOscillator();
-      osc.type  = 'sine';
-      osc.frequency.value = baseFreq * r;
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(amps[i] * 0.32, now);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + decays[i]);
-      osc.connect(g); g.connect(output);
-      osc.start(now); osc.stop(now + decays[i] + 0.08);
+  // ─── Karplus-Strong プラック弦合成 ───
+  // 撥のノイズを「弦長＝サンプリング周波数 / 周波数」のリングバッファで
+  // 循環させ、毎周ローパス相当の平均化で減衰。フィードバック値で持続を制御。
+  function pluckBuffer(ctx, freq, duration = 1.6, decay = 0.997) {
+    const sr  = ctx.sampleRate;
+    const len = Math.floor(sr * duration);
+    const N   = Math.max(2, Math.floor(sr / freq));
+    const buf = ctx.createBuffer(1, len, sr);
+    const out = buf.getChannelData(0);
+
+    const ring = new Float32Array(N);
+    for (let i = 0; i < N; i++) ring[i] = (Math.random() * 2 - 1);
+
+    let p = 0;
+    for (let i = 0; i < len; i++) {
+      const cur = ring[p];
+      const nxt = ring[(p + 1) % N];
+      out[i]   = cur;
+      ring[p]  = (cur + nxt) * 0.5 * decay;
+      p = (p + 1) % N;
+    }
+    return buf;
+  }
+
+  // ─── ギター単音 (3声トリプルトラッキング: L/C/R にデチューン) ───
+  // amps は { inp } を持つアンプチャンネルの配列(3つ)。
+  // 各声をそれぞれ別アンプに送り、わずかなピッチ差と時間差で
+  // 「録り直しを 3回重ねた」ような厚いステレオ像を作る。
+  function pickGuitar(ctx, amps, freq, vel, dur = 0.95) {
+    const sr     = ctx.sampleRate;
+    const voices = [
+      { detune: 0.997, delay: 0.012, gain: 0.55, ampIdx: 0 },  // L slightly flat, late
+      { detune: 1.000, delay: 0.000, gain: 0.65, ampIdx: 1 },  // C on time
+      { detune: 1.003, delay: 0.020, gain: 0.55, ampIdx: 2 },  // R slightly sharp, late
+    ];
+
+    voices.forEach((v) => {
+      const start = ctx.currentTime + v.delay;
+      const buf   = pluckBuffer(ctx, freq * v.detune, dur, 0.996);
+      const src   = ctx.createBufferSource(); src.buffer = buf;
+      const env   = ctx.createGain();
+      env.gain.setValueAtTime(0, start);
+      env.gain.linearRampToValueAtTime(vel * v.gain, start + 0.005);
+      env.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      src.connect(env); env.connect(amps[v.ampIdx].inp);
+      src.start(start); src.stop(start + dur + 0.05);
+    });
+
+    // ピックアタック (センターアンプのみ)
+    const now = ctx.currentTime;
+    const pkB = ctx.createBuffer(1, Math.floor(sr * 0.008), sr);
+    const pkD = pkB.getChannelData(0);
+    for (let i = 0; i < pkD.length; i++) pkD[i] = Math.random() * 2 - 1;
+    const pk  = ctx.createBufferSource(); pk.buffer = pkB;
+    const pkF = ctx.createBiquadFilter(); pkF.type = 'highpass'; pkF.frequency.value = 2200;
+    const pkG = ctx.createGain();
+    pkG.gain.setValueAtTime(vel * 0.20, now);
+    pkG.gain.exponentialRampToValueAtTime(0.0001, now + 0.012);
+    pk.connect(pkF); pkF.connect(pkG); pkG.connect(amps[1].inp);
+    pk.start(now); pk.stop(now + 0.013);
+  }
+
+  // ─── コードストローク (フル三和音、ダウンストロークの時間差付き) ───
+  // voicing は低い音から順の周波数配列(各コードの 5音くらい)。
+  // 各弦をわずかに遅らせて鳴らすと "ジャラーン" のストローク感が出る。
+  function strumChord(ctx, amps, voicing, vel, dur = 1.4, downstroke = true) {
+    voicing.forEach((f, i) => {
+      const idx = downstroke ? i : (voicing.length - 1 - i);
+      const delayMs = idx * (5 + Math.random() * 5);
+      // 高い弦ほど少し小さめ (ピックは下から上に当たる)
+      const noteVel = vel * (0.95 - i * 0.04);
+      setTimeout(() => pickGuitar(ctx, amps, f, noteVel, dur), delayMs);
     });
   }
 
-  // 笛 ─ ブレスノイズ + ビブラート付きサイン
-  function createFue(ctx, output) {
-    const sr  = ctx.sampleRate;
-    const len = Math.floor(sr * 4);
-    const nBuf = ctx.createBuffer(1, len, sr);
-    const nd   = nBuf.getChannelData(0);
-    for (let i = 0; i < len; i++) nd[i] = Math.random() * 2 - 1;
-
-    const noiseNode  = ctx.createBufferSource();
-    noiseNode.buffer = nBuf; noiseNode.loop = true;
-    const breathFilt = ctx.createBiquadFilter();
-    breathFilt.type  = 'bandpass';
-    breathFilt.frequency.value = 1400;
-    breathFilt.Q.value = 3.5;
-    const breathGain = ctx.createGain();
-    breathGain.gain.value = 0.10;
-    noiseNode.connect(breathFilt); breathFilt.connect(breathGain); breathGain.connect(output);
-    noiseNode.start();
-
-    const fueOsc = ctx.createOscillator();
-    fueOsc.type  = 'sine';
-    fueOsc.frequency.value = 523.25;  // C5
-
-    const vibLFO   = ctx.createOscillator();
-    vibLFO.type    = 'sine';
-    vibLFO.frequency.value = 5.2;
-    const vibGain  = ctx.createGain();
-    vibGain.gain.value = 7;
-    vibLFO.connect(vibGain); vibGain.connect(fueOsc.frequency);
-
-    const fueGain  = ctx.createGain();
-    fueGain.gain.value = 0.20;
-    fueOsc.connect(fueGain); fueGain.connect(output);
-    fueOsc.start(); vibLFO.start();
-
-    return { breathFilt, breathGain, fueOsc, vibLFO, vibGain, fueGain };
+  // ─── ギターアンプチャンネル (L/C/R それぞれ独立の歪みチェーン) ───
+  // 個々の音声がここを通って summing される前にパンされる。
+  // distortionAmount を少しずつ変えると、3声がそれぞれ異なる「弾き手」のような表情に。
+  function makeGuitarAmp(ctx, panValue, distortAmount) {
+    const inp  = ctx.createGain(); inp.gain.value = 1.0;
+    const dist = ctx.createWaveShaper();
+    dist.curve = makeDistortionCurve(distortAmount);
+    dist.oversample = '4x';
+    const tone = ctx.createBiquadFilter();
+    tone.type  = 'lowpass'; tone.frequency.value = 3200; tone.Q.value = 0.7;
+    const pres = ctx.createBiquadFilter();
+    pres.type  = 'peaking'; pres.frequency.value = 2400;
+    pres.gain.value = 4; pres.Q.value = 1.2;
+    const pan  = ctx.createStereoPanner(); pan.pan.value = panValue;
+    inp.connect(dist); dist.connect(tone); tone.connect(pres); pres.connect(pan);
+    return { inp, dist, tone, pres, pan };
   }
 
-  // ============================================================
-  //  追加楽器: 小鼓・締太鼓・拍子木・鈴・鉦連打
-  // ============================================================
-
-  // 小鼓 (kotsuzumi) — 胴鳴り「ポン」音
-  function hitKotsuzumi(ctx, output, freq, vel) {
+  // ─── ベースノート (saw + sub sine + LPF) ───
+  function playBass(ctx, ampInput, freq, vel, dur = 0.45) {
     const now = ctx.currentTime;
-    const sr  = ctx.sampleRate;
-    const nb = ctx.createBuffer(1, Math.floor(sr * 0.25), sr);
-    const nd = nb.getChannelData(0);
-    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
-    const ns = ctx.createBufferSource(); ns.buffer = nb;
-    const f  = ctx.createBiquadFilter();
-    f.type   = 'bandpass'; f.frequency.value = freq * 2.2; f.Q.value = 5.0;
-    const g  = ctx.createGain();
-    g.gain.setValueAtTime(vel * 1.3, now);
-    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.20);
-    ns.connect(f); f.connect(g); g.connect(output);
-    ns.start(now); ns.stop(now + 0.22);
-    const osc = ctx.createOscillator(); osc.type = 'sine';
-    osc.frequency.setValueAtTime(freq * 3.8, now);
-    osc.frequency.exponentialRampToValueAtTime(freq * 1.6, now + 0.14);
-    const og = ctx.createGain();
-    og.gain.setValueAtTime(vel * 0.60, now);
-    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
-    osc.connect(og); og.connect(output);
-    osc.start(now); osc.stop(now + 0.18);
+
+    const osc = ctx.createOscillator();
+    osc.type  = 'sawtooth';
+    osc.frequency.value = freq;
+
+    const sub = ctx.createOscillator();
+    sub.type  = 'sine';
+    sub.frequency.value = freq * 0.5;
+
+    // 静止 LPF — ampInput 側でトーンを整形するので、ここはアタックフィルタとして
+    const lp = ctx.createBiquadFilter();
+    lp.type  = 'lowpass';
+    lp.frequency.setValueAtTime(freq * 7, now);
+    lp.frequency.exponentialRampToValueAtTime(freq * 2.4, now + dur * 0.5);
+    lp.Q.value = 2.5;
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0, now);
+    env.gain.linearRampToValueAtTime(vel * 0.55, now + 0.006);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    const subEnv = ctx.createGain();
+    subEnv.gain.setValueAtTime(0, now);
+    subEnv.gain.linearRampToValueAtTime(vel * 0.30, now + 0.008);
+    subEnv.gain.exponentialRampToValueAtTime(0.0001, now + dur * 0.9);
+
+    osc.connect(lp); lp.connect(env); env.connect(ampInput);
+    sub.connect(subEnv); subEnv.connect(ampInput);
+    osc.start(now); osc.stop(now + dur + 0.05);
+    sub.start(now); sub.stop(now + dur + 0.05);
   }
 
-  // 締太鼓 (shime-daiko) — タイトな高域打音
-  function hitShimeDaiko(ctx, output, freq, vel) {
+  // ─── キックドラム (低域サインスイープ + クリック) ───
+  function hitKick(ctx, output, vel) {
     const now = ctx.currentTime;
-    const sr  = ctx.sampleRate;
-    const nb = ctx.createBuffer(1, Math.floor(sr * 0.10), sr);
-    const nd = nb.getChannelData(0);
-    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
-    const ns = ctx.createBufferSource(); ns.buffer = nb;
-    const f  = ctx.createBiquadFilter();
-    f.type   = 'bandpass'; f.frequency.value = freq * 4.0; f.Q.value = 3.5;
-    const g  = ctx.createGain();
-    g.gain.setValueAtTime(vel * 1.8, now);
-    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
-    ns.connect(f); f.connect(g); g.connect(output);
-    ns.start(now); ns.stop(now + 0.10);
-    const osc = ctx.createOscillator(); osc.type = 'sine';
-    osc.frequency.setValueAtTime(freq * 5.5, now);
-    osc.frequency.exponentialRampToValueAtTime(freq * 2.2, now + 0.06);
-    const og = ctx.createGain();
-    og.gain.setValueAtTime(vel * 0.70, now);
-    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
-    osc.connect(og); og.connect(output);
-    osc.start(now); osc.stop(now + 0.09);
+    const osc = ctx.createOscillator();
+    osc.type  = 'sine';
+    osc.frequency.setValueAtTime(120, now);
+    osc.frequency.exponentialRampToValueAtTime(38, now + 0.09);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(vel * 1.25, now);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + 0.42);
+    osc.connect(env); env.connect(output);
+    osc.start(now); osc.stop(now + 0.45);
+
+    // ビーターのクリック
+    const sr = ctx.sampleRate;
+    const cb = ctx.createBuffer(1, Math.floor(sr * 0.012), sr);
+    const cd = cb.getChannelData(0);
+    for (let i = 0; i < cd.length; i++) cd[i] = Math.random() * 2 - 1;
+    const cs = ctx.createBufferSource(); cs.buffer = cb;
+    const cf = ctx.createBiquadFilter(); cf.type = 'highpass'; cf.frequency.value = 1500;
+    const cg = ctx.createGain();
+    cg.gain.setValueAtTime(vel * 0.55, now);
+    cg.gain.exponentialRampToValueAtTime(0.0001, now + 0.012);
+    cs.connect(cf); cf.connect(cg); cg.connect(output);
+    cs.start(now); cs.stop(now + 0.013);
   }
 
-  // 拍子木 (hyoshigi) — 乾いた木の打音
-  function hitHyoshigi(ctx, output, vel) {
+  // ─── スネア (220Hz トーン + ハイパスノイズ) ───
+  function hitSnare(ctx, output, vel) {
     const now = ctx.currentTime;
-    const sr  = ctx.sampleRate;
-    const nb = ctx.createBuffer(1, Math.floor(sr * 0.035), sr);
-    const nd = nb.getChannelData(0);
-    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
-    const ns = ctx.createBufferSource(); ns.buffer = nb;
-    const hf = ctx.createBiquadFilter(); hf.type = 'highpass'; hf.frequency.value = 1800;
-    const g  = ctx.createGain();
-    g.gain.setValueAtTime(vel * 2.2, now);
-    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.030);
-    ns.connect(hf); hf.connect(g); g.connect(output);
-    ns.start(now); ns.stop(now + 0.038);
-    const osc = ctx.createOscillator(); osc.type = 'sine';
-    osc.frequency.value = 1350 + Math.random() * 300;
+
+    const osc = ctx.createOscillator();
+    osc.type  = 'triangle';
+    osc.frequency.setValueAtTime(220, now);
+    osc.frequency.exponentialRampToValueAtTime(140, now + 0.08);
     const og = ctx.createGain();
-    og.gain.setValueAtTime(vel * 0.50, now + 0.002);
-    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+    og.gain.setValueAtTime(vel * 0.45, now);
+    og.gain.exponentialRampToValueAtTime(0.0001, now + 0.13);
     osc.connect(og); og.connect(output);
     osc.start(now); osc.stop(now + 0.15);
+
+    const sr = ctx.sampleRate;
+    const nb = ctx.createBuffer(1, Math.floor(sr * 0.18), sr);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns = ctx.createBufferSource(); ns.buffer = nb;
+    const nf = ctx.createBiquadFilter(); nf.type = 'highpass'; nf.frequency.value = 850;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.85, now);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+    ns.connect(nf); nf.connect(ng); ng.connect(output);
+    ns.start(now); ns.stop(now + 0.18);
   }
 
-  // 鈴 (suzu) — 揺れる鈴（デチューンしたサイン波クラスター）
-  function hitSuzu(ctx, output, baseFreq, vel) {
-    const now   = ctx.currentTime;
-    const parts = [
-      { f: baseFreq,          amp: 0.32, dec: 0.55 },
-      { f: baseFreq * 1.005,  amp: 0.25, dec: 0.48 },
-      { f: baseFreq * 0.997,  amp: 0.22, dec: 0.52 },
-      { f: baseFreq * 2.010,  amp: 0.18, dec: 0.38 },
-      { f: baseFreq * 2.008,  amp: 0.14, dec: 0.32 },
-      { f: baseFreq * 3.012,  amp: 0.09, dec: 0.25 },
-    ];
-    parts.forEach(({ f, amp, dec }, i) => {
-      const osc = ctx.createOscillator(); osc.type = 'sine';
-      osc.frequency.value = f;
-      const g = ctx.createGain();
-      g.gain.setValueAtTime(vel * amp, now + i * 0.007);
-      g.gain.exponentialRampToValueAtTime(0.0001, now + dec);
-      osc.connect(g); g.connect(output);
-      osc.start(now + i * 0.007); osc.stop(now + dec + 0.05);
-    });
+  // ─── ハイハット (高域ノイズ短) ───
+  function hitHihat(ctx, output, vel, open = false) {
+    const now = ctx.currentTime;
+    const sr  = ctx.sampleRate;
+    const dur = open ? 0.24 : 0.045;
+    const nb  = ctx.createBuffer(1, Math.floor(sr * dur), sr);
+    const nd  = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns  = ctx.createBufferSource(); ns.buffer = nb;
+    const nf  = ctx.createBiquadFilter();
+    nf.type   = 'highpass'; nf.frequency.value = 7200; nf.Q.value = 0.8;
+    const nf2 = ctx.createBiquadFilter();
+    nf2.type  = 'bandpass'; nf2.frequency.value = 9500; nf2.Q.value = 0.5;
+    const ng  = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.42, now);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    ns.connect(nf); nf.connect(nf2); nf2.connect(ng); ng.connect(output);
+    ns.start(now); ns.stop(now + dur + 0.01);
   }
 
-  // 鉦連打 (チンチキチン pattern) — チン・チキ・チン
-  function hitKaneBurst(ctx, output, baseFreq, vel) {
-    const timings = [0, 105, 185, 330];
-    const vels    = [1.0, 0.45, 0.42, 0.88];
-    timings.forEach((ms, i) => {
-      setTimeout(() => {
-        if (!ctx) return;
-        hitKane(ctx, output, baseFreq * (1 + (Math.random() - 0.5) * 0.03), vel * vels[i]);
-      }, ms);
-    });
+  // ─── クラッシュシンバル (長いハイパスノイズ + 高速減衰) ───
+  function hitCrash(ctx, output, vel) {
+    const now = ctx.currentTime;
+    const sr  = ctx.sampleRate;
+    const dur = 1.7;
+    const nb  = ctx.createBuffer(1, Math.floor(sr * dur), sr);
+    const nd  = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns  = ctx.createBufferSource(); ns.buffer = nb;
+    const nf  = ctx.createBiquadFilter();
+    nf.type   = 'highpass'; nf.frequency.value = 4000;
+    const ng  = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.55, now);
+    ng.gain.exponentialRampToValueAtTime(0.06, now + 0.06);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    ns.connect(nf); nf.connect(ng); ng.connect(output);
+    ns.start(now); ns.stop(now + dur + 0.02);
+  }
+
+  // ─── タム (サインスイープ + シェル鳴り) ───
+  function hitTom(ctx, output, freq, vel) {
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type  = 'sine';
+    osc.frequency.setValueAtTime(freq * 1.4, now);
+    osc.frequency.exponentialRampToValueAtTime(freq * 0.7, now + 0.18);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(vel * 0.7, now);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+    osc.connect(env); env.connect(output);
+    osc.start(now); osc.stop(now + 0.34);
+
+    const sr = ctx.sampleRate;
+    const nb = ctx.createBuffer(1, Math.floor(sr * 0.08), sr);
+    const nd = nb.getChannelData(0);
+    for (let i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+    const ns = ctx.createBufferSource(); ns.buffer = nb;
+    const nf = ctx.createBiquadFilter();
+    nf.type  = 'bandpass'; nf.frequency.value = freq * 3; nf.Q.value = 1.5;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(vel * 0.30, now);
+    ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.08);
+    ns.connect(nf); nf.connect(ng); ng.connect(output);
+    ns.start(now); ns.stop(now + 0.09);
   }
 
   // ============================================================
-  //  屋台囃子 自律リズムループ
-  //  センサーなしでも鳴り続ける基本リズム
-  //  S.accMag・S.brightness・tempoDetector に連動してダイナミクス変化
+  //  ロックグルーヴ自律ループ (Oasis アンセム仕様)
+  //  4/4 拍子: kick 1,3 / snare 2,4 / hihat 8分
+  //  _activeProgression (現在の曲のコード列) を 1小節ごとに進める。
+  //  ベースは 8分音符でコードの bassNotes を順番に踏む(歩く)。
+  //  4小節周期でクラッシュ・コード進行の繰り返し・たまにフィル。
+  //  S.accMag・tempoDetector で BPM とベロシティが揺れる。
   // ============================================================
-  function startHayashiRhythm(bus, taikoF, kaneF) {
-    let beatN = 0;
+  // 現在のコード(advanceLead からも参照される閉包変数)
+  let _currentChord = CHORDS.G;
+  // 曲切替時に measureN をリセットして新曲の頭(コード1)から始めるためのフラグ
+  let _songJustChanged = false;
 
-    function tick() {
+  // ─── 曲切替: 進行 / BPM / 歪み量 / サブベースのトニックを更新 ───
+  function applySong(idx) {
+    const song = SONGS[idx];
+    _activeSongIdx     = idx;
+    _activeProgression = song.progression;
+    _activeBpmBase     = song.bpmBase;
+    _activeDrive       = song.drive;
+    _songJustChanged   = true;
+
+    if (audioCtx && _audioRefs?.guitarAmps) {
+      // 3チャンネルそれぞれに ±5 のずれた歪みカーブを再生成
+      const offs = [-5, 0, -5];
+      _audioRefs.guitarAmps.forEach((amp, i) => {
+        amp.dist.curve = makeDistortionCurve(song.drive + offs[i]);
+      });
+    }
+    // サブベースドローンを新曲のトニックに ramp
+    if (audioCtx && _audioRefs?.droneOsc) {
+      _audioRefs.droneOsc.frequency.linearRampToValueAtTime(
+        song.tonic, audioCtx.currentTime + 1.2
+      );
+    }
+    console.log('[song]', idx, song.name);
+  }
+
+  function startRockGroove(drumBus, guitarAmps, bassIn) {
+    let measureN = 0;
+
+    function nextTick() {
       if (!audioCtx) return;
 
-      const conf   = tempoDetector.effectiveConfidence();
-      const bpm    = conf > 0.25
-        ? Math.min(155, Math.max(85, tempoDetector.getBPM()))
-        : 105 + S.accMag * 28;
-      const beatMs = 60000 / bpm;
-      const vel    = 0.18 + S.accMag * 0.38 + S.brightness * 0.10;
-
-      beatN++;
-
-      // ── ビート1: 太鼓（常に） ──
-      hitTaiko(audioCtx, bus, taikoF, vel * (0.72 + Math.random() * 0.28));
-
-      // ── ビート1.5: 小鼓（裏拍） ──
-      if (Math.random() < 0.82) {
-        setTimeout(() => hitKotsuzumi(audioCtx, bus, taikoF * 2.5, vel * 0.65),
-                   beatMs * 0.5 | 0);
+      // 曲が直前に切り替わった場合は新曲のコード1から始める + クラッシュで合図
+      if (_songJustChanged) {
+        _songJustChanged = false;
+        measureN = 0;
+        hitCrash(audioCtx, drumBus, 0.7);
       }
 
-      // ── ビート1.67: 太鼓どこドン ──
-      if (Math.random() < 0.68) {
-        setTimeout(() => hitTaiko(audioCtx, bus, taikoF, vel * 0.52),
-                   beatMs * 0.67 | 0);
+      const conf = tempoDetector.effectiveConfidence();
+      // 担ぎ手のテンポを優先しつつ、無いときは曲固有の bpmBase
+      const bpm  = conf > 0.25
+        ? Math.min(_activeBpmBase * 1.4, Math.max(_activeBpmBase * 0.7, tempoDetector.getBPM()))
+        : _activeBpmBase + S.accMag * 25;
+      const sixteenth = 60000 / bpm / 4;
+      const measureMs = sixteenth * 16;
+      const vel = 0.30 + S.accMag * 0.38 + S.brightness * 0.08;
+
+      // 今の小節のコードを active progression から取得
+      const chordName = _activeProgression[measureN % _activeProgression.length];
+      const chord     = CHORDS[chordName];
+      _currentChord   = chord;
+      measureN++;
+
+      // === 16ステップでドラム・ベース・ギターを組む ===
+      for (let s = 0; s < 16; s++) {
+        const tMs = (sixteenth * s) | 0;
+
+        // ハイハット: 8分音符
+        if (s % 2 === 0) {
+          const hhVel = vel * (s % 4 === 0 ? 0.85 : 0.55);
+          const open  = (s === 14 && Math.random() < 0.30);
+          setTimeout(() => hitHihat(audioCtx, drumBus, hhVel, open), tMs);
+        }
+
+        // キック: 1拍目, 3拍目, 食い気味の3拍目裏たまに
+        if (s === 0 || s === 8 || (s === 6 && Math.random() < 0.25)) {
+          setTimeout(() => { hitKick(audioCtx, drumBus, vel * 1.0); duckSidechain(); }, tMs);
+        }
+
+        // スネア: 2拍目, 4拍目 (バックビート)
+        if (s === 4 || s === 12) {
+          setTimeout(() => hitSnare(audioCtx, drumBus, vel * 0.85), tMs);
+        }
+
+        // ベース: 8分刻み、コードの bassNotes を順に歩く
+        // (s/2 = 0..7 を bassNotes.length で割って循環)
+        if (s % 2 === 0) {
+          const beatN  = s >> 1;        // 0..7 (1小節 8分8個)
+          const bIdx   = beatN % chord.bassNotes.length;
+          const bFreq  = chord.bassNotes[bIdx];
+          const bvel   = vel * (s === 0 ? 0.80 : (s % 4 === 0 ? 0.65 : 0.50));
+          setTimeout(() => playBass(audioCtx, bassIn, bFreq, bvel,
+                                    sixteenth * 1.6 / 1000), tMs);
+        }
+
+        // ギターストローク: 1拍目に大きく、3拍目に弱く(下→上の "ジャラーン")
+        if (s === 0) {
+          setTimeout(() => strumChord(audioCtx, guitarAmps, chord.voicing,
+                                      vel * 0.90, sixteenth * 12 / 1000, true), tMs);
+        } else if (s === 8) {
+          // 弱拍は上ストローク
+          setTimeout(() => strumChord(audioCtx, guitarAmps, chord.voicing,
+                                      vel * 0.55, sixteenth * 6 / 1000, false), tMs);
+        }
+
+        // 8分裏の弱ストローク (Oasis の "ジャカジャカ" 感)
+        if ((s === 4 || s === 12) && Math.random() < 0.50) {
+          setTimeout(() => strumChord(audioCtx, guitarAmps, chord.voicing,
+                                      vel * 0.30, sixteenth * 4 / 1000, true), tMs);
+        }
+
+        // 4小節目最後の方はタムフィル
+        if (measureN % 4 === 0 && s >= 12 && s % 2 === 0 && Math.random() < 0.55) {
+          const tomFreq = 110 + (s - 12) * 22;
+          setTimeout(() => hitTom(audioCtx, drumBus, tomFreq, vel * 0.70), tMs);
+        }
       }
 
-      // ── ビート2: 締太鼓 ──
-      if (Math.random() < 0.60) {
-        setTimeout(() => hitShimeDaiko(audioCtx, bus, taikoF, vel * 0.78),
-                   beatMs * 1.0 | 0);
+      // クラッシュ: 進行の頭で
+      if ((measureN - 1) % _activeProgression.length === 0 && Math.random() < 0.65) {
+        hitCrash(audioCtx, drumBus, vel * 0.60);
       }
 
-      // ── ビート2.5: 小鼓 ──
-      if (Math.random() < 0.65) {
-        setTimeout(() => hitKotsuzumi(audioCtx, bus, taikoF * 2.5, vel * 0.50),
-                   beatMs * 1.5 | 0);
-      }
-
-      // ── ビート3: 太鼓（やや軽め） ──
-      if (Math.random() < 0.55) {
-        setTimeout(() => hitTaiko(audioCtx, bus, taikoF, vel * 0.45),
-                   beatMs * 2.0 | 0);
-      }
-
-      // ── ビート3.5: 締太鼓フィル ──
-      if (Math.random() < 0.50) {
-        setTimeout(() => hitShimeDaiko(audioCtx, bus, taikoF, vel * 0.60),
-                   beatMs * 2.5 | 0);
-      }
-
-      // ── 鉦: 3拍ごと ──
-      if (beatN % 3 === 0) {
-        const kd = (beatMs * (0.8 + Math.random() * 0.6)) | 0;
-        setTimeout(() => hitKane(audioCtx, bus, kaneF, vel * 0.82), kd);
-      }
-
-      // ── 鉦連打 チンチキチン: 8拍ごと ──
-      if (beatN % 8 === 0) {
-        setTimeout(() => hitKaneBurst(audioCtx, bus, kaneF, vel * 0.62),
-                   beatMs * 2.2 | 0);
-      }
-
-      // ── 拍子木: まれに ──
-      if (beatN % 14 === 0) {
-        hitHyoshigi(audioCtx, bus, vel * 0.88);
-      }
-
-      // ── 鈴: 動きが大きいとき ──
-      if (S.accMag > 0.30 && Math.random() < 0.42) {
-        setTimeout(() => hitSuzu(audioCtx, bus, kaneF * 2, vel * 0.58),
-                   beatMs * 0.22 | 0);
-      }
-
-      // ── 2拍単位で次へ（±8%のゆらぎ） ──
-      setTimeout(tick, (beatMs * 2 * (0.92 + Math.random() * 0.16)) | 0);
+      setTimeout(nextTick, measureMs | 0);
     }
 
-    setTimeout(tick, 1000);
+    setTimeout(nextTick, 800);
   }
 
   // ============================================================
@@ -916,142 +1073,171 @@
       console.warn('[audio] マイク取得失敗:', e);
     }
 
-    // ─── 担ぎ手ごとの基音 ───
-    const baseIdx   = Math.min(voiceIndex * 3, YO.length - 1);
-    const taikoFreq = YO[Math.max(0, baseIdx - 5)] || 110;
-    const kaneFreq  = YO[Math.min(baseIdx + 2, YO.length - 1)] || 220;
+    // ─── ギターアンプ 3チャンネル (L/C/R) ───
+    // Oasis のクランチ感に合わせて控えめな歪み (amount 25-30、ファズではなくドライブ寄り)
+    const guitarAmps = [
+      makeGuitarAmp(audioCtx, -0.7, 25),  // L
+      makeGuitarAmp(audioCtx,  0.0, 30),  // C
+      makeGuitarAmp(audioCtx,  0.7, 25),  // R
+    ];
+    const guitarBus = audioCtx.createGain(); guitarBus.gain.value = 0.42;
+    guitarAmps.forEach(a => a.pan.connect(guitarBus));
 
-    // 起動一打
-    setTimeout(() => hitTaiko(audioCtx, instrBus, taikoFreq, 0.55), 300);
-    setTimeout(() => hitKane(audioCtx, instrBus, kaneFreq),          750);
+    // ── サイドチェイン用 ダックゲイン (キックで一瞬下がる) ──
+    const guitarDuck = audioCtx.createGain(); guitarDuck.gain.value = 1.0;
+    guitarBus.connect(guitarDuck);
+    guitarDuck.connect(instrBus);
 
-    // 笛（主旋律）
-    fueObj = createFue(audioCtx, instrBus);
+    // ─── ベースアンプチェーン (ローパス + 低域ピーキング) ───
+    const bassAmp = audioCtx.createGain(); bassAmp.gain.value = 1.0;
+    const bassToneFilt = audioCtx.createBiquadFilter();
+    bassToneFilt.type = 'lowpass';
+    bassToneFilt.frequency.value = 850;
+    bassToneFilt.Q.value = 1.0;
+    const bassPunch = audioCtx.createBiquadFilter();
+    bassPunch.type  = 'peaking';
+    bassPunch.frequency.value = 90;
+    bassPunch.gain.value = 5;
+    bassPunch.Q.value = 1.5;
+    const bassBus = audioCtx.createGain(); bassBus.gain.value = 0.65;
+    bassAmp.connect(bassToneFilt);
+    bassToneFilt.connect(bassPunch);
+    bassPunch.connect(bassBus);
+    const bassDuck = audioCtx.createGain(); bassDuck.gain.value = 1.0;
+    bassBus.connect(bassDuck);
+    bassDuck.connect(instrBus);
 
-    // 第2笛（4度上のハーモニー）
-    fue2Obj = createFue(audioCtx, instrBus);
-    fue2Obj.fueOsc.frequency.value = YO[Math.min(8 + baseIdx + 3, YO.length - 1)];
-    fue2Obj.fueGain.gain.value     = 0.09;
-    fue2Obj.breathGain.gain.value  = 0.04;
-    fue2Obj.vibGain.gain.value     = 5.5;
-    fue2Obj.vibLFO.frequency.value = 5.9;
+    // ─── ドラムバス (ドラムは生音、リバーブ控えめ) ───
+    const drumBus = audioCtx.createGain(); drumBus.gain.value = 0.85;
+    drumBus.connect(instrBus);
 
-    // 環境ドローン（低域三角波）
-    const droneOsc = audioCtx.createOscillator();
-    droneOsc.type  = 'triangle';
-    droneOsc.frequency.value = taikoFreq * 0.5;
-    const droneGain = audioCtx.createGain(); droneGain.gain.value = 0.13;
-    droneOsc.connect(droneGain); droneGain.connect(rvSend);
-    droneOsc.start();
+    // 起動一打 (G major コードで「立ち上がり感」)
+    setTimeout(() => { hitKick(audioCtx, drumBus, 0.6); duckSidechain(); },  300);
+    setTimeout(() => strumChord(audioCtx, guitarAmps, CHORDS.G.voicing, 0.55, 1.4), 320);
+    setTimeout(() => hitCrash(audioCtx, drumBus, 0.45),                      330);
 
-    // 環境ノイズテクスチャ
+    // ─── 環境ノイズテクスチャ (アンプヒス感、薄め) ───
     const envBuf = audioCtx.createBuffer(1, audioCtx.sampleRate * 4, audioCtx.sampleRate);
     const ed = envBuf.getChannelData(0);
     for (let i = 0; i < ed.length; i++) ed[i] = Math.random() * 2 - 1;
     const envSrc = audioCtx.createBufferSource();
     envSrc.buffer = envBuf; envSrc.loop = true;
     const envFilt = audioCtx.createBiquadFilter();
-    envFilt.type  = 'bandpass'; envFilt.frequency.value = 500; envFilt.Q.value = 0.9;
-    const envGain = audioCtx.createGain(); envGain.gain.value = 0.055;
+    envFilt.type  = 'bandpass'; envFilt.frequency.value = 800; envFilt.Q.value = 0.7;
+    const envGain = audioCtx.createGain(); envGain.gain.value = 0.025;
     envSrc.connect(envFilt); envFilt.connect(envGain); envGain.connect(rvSend);
     envSrc.start();
+
+    // ─── サブベースドローン (G1 = 49Hz) ───
+    const droneOsc = audioCtx.createOscillator();
+    droneOsc.type  = 'triangle';
+    droneOsc.frequency.value = 49.00;   // G1
+    const droneGain = audioCtx.createGain(); droneGain.gain.value = 0.06;
+    droneOsc.connect(droneGain); droneGain.connect(bassAmp);
+    droneOsc.start();
 
     _audioRefs = {
       instrBus, rvSend, comp, master, convRev,
       envFilt, envGain, droneGain, droneOsc,
+      guitarAmps, guitarBus, guitarDuck,
+      bassAmp, bassBus, bassDuck, drumBus,
     };
 
-    // ── 屋台囃子 自律リズムループ起動 ──
-    startHayashiRhythm(instrBus, taikoFreq, kaneFreq);
+    // ── ロックグルーヴ自律ループ起動 ──
+    startRockGroove(drumBus, guitarAmps, bassAmp);
+
+    // ── 3:30 ごとに次の曲へ循環 (端末ローカル) ──
+    applySong(0);   // 初期曲を反映 (歪み量・ドローン周波数)
+    setInterval(() => {
+      applySong((_activeSongIdx + 1) % SONGS.length);
+    }, SONG_DURATION_MS);
 
     // ─── リズムトリガー（加速度ピーク） ───
-    let kaneCount = 0;
+    // 担ぎ手の動きが大きいときに瞬間的にフィル/オープンハット/クラッシュが入る
+    let peakCount = 0;
     onPeak((rel) => {
-      // テンポ検出器にピーク時刻を登録（担ぎリズムを学習）
       tempoDetector.addPeak(performance.now());
       const vel = Math.min(rel / 5, 1);
-      const ni  = Math.max(0, Math.min(baseIdx + Math.floor(S.brightness * 4), YO.length - 1));
+      peakCount++;
 
-      // 太鼓（主打）
-      hitTaiko(audioCtx, instrBus, YO[Math.max(0, ni - 4)], 0.42 + vel * 0.55);
-
-      // 小鼓（常時、裏拍感）
-      hitKotsuzumi(audioCtx, instrBus, YO[Math.min(ni + 2, YO.length - 1)] * 2, vel * 0.72);
-
-      // 鉦（4打に1回）
-      if (++kaneCount % 4 === 0) {
-        hitKane(audioCtx, instrBus, kaneFreq * (1 + S.colorTemp * 0.8));
+      // タムフィル(連打)
+      if (vel > 0.55 && Math.random() < 0.45) {
+        const tomFs = [180, 140, 110, 85];
+        tomFs.forEach((f, i) => {
+          setTimeout(() => hitTom(audioCtx, drumBus, f, vel * 0.7), i * 80);
+        });
       }
 
-      // 鉦（ランダム）
-      if (Math.random() < 0.38) {
-        hitKane(audioCtx, instrBus, 650 + Math.random() * 750);
+      // オープンハット (動きアクセント)
+      if (Math.random() < 0.40) {
+        hitHihat(audioCtx, drumBus, vel * 0.55, true);
       }
 
-      // 締太鼓フィル（少し遅れて）
-      if (Math.random() < 0.58) {
-        setTimeout(() => hitShimeDaiko(audioCtx, instrBus, taikoFreq, vel * 0.70),
-                   (75 + Math.random() * 100) | 0);
+      // クラッシュ (大きい動き)
+      if (vel > 0.65 && peakCount % 4 === 0) {
+        hitCrash(audioCtx, drumBus, vel * 0.55);
       }
 
-      // 鉦連打 チンチキチン（まれに）
-      if (Math.random() < 0.20) {
-        setTimeout(() => hitKaneBurst(audioCtx, instrBus, kaneFreq, vel * 0.62), 200);
-      }
-
-      // 拍子木（まれに）
-      if (Math.random() < 0.15) {
-        hitHyoshigi(audioCtx, instrBus, vel * 0.78);
-      }
-
-      // 鈴（vel 高いとき）
-      if (vel > 0.52 && Math.random() < 0.45) {
-        setTimeout(() => hitSuzu(audioCtx, instrBus, kaneFreq * 2, vel * 0.52), 30);
+      // ベースのオクターブグリス (大きい動き、コードの 5度に向かって)
+      if (vel > 0.55 && Math.random() < 0.30) {
+        const fifthFreq = (_currentChord?.bassNotes?.[1]) || 73.42;
+        playBass(audioCtx, bassAmp, fifthFreq, vel * 0.6, 0.32);
       }
     });
 
-    // ─── 笛フレーズ自動進行（テンポ連動版） ───
-    // tempoDetector の confidence が高いほど:
-    //   ・音符移動が積極的になる（確信を持って動く）
-    //   ・フレーズ間隔が担ぎ手のリズムに引き寄せられる
-    //   ・ステップが大きくなる（テンポが安定しているときは跳躍も増える）
-    // confidence が低い(テンポ未確立)ときは従来の accMag ベースで漂う
-    let fueFreqIdx = Math.min(8 + baseIdx, YO.length - 3);
-    function advanceFue() {
-      const conf = tempoDetector.effectiveConfidence();
+    // ─── ギターリード自動進行 (コード進行追従、Oasis 寄り) ───
+    // 各コードの lead 配列(コードトーン + 隣接スケール音) の中をゆっくり歩く。
+    // フレーズ感を出すため: 1〜3音 → 休符 → 1〜3音 のパターン。
+    // confidence が高い時はフレーズ長が伸び、ベンドやハーモニーが入る。
+    let leadStep = 0;   // 現在のコードの lead 配列内 index
+    let phraseQueue = 0;  // 残りフレーズ音数 (0 で休符に入る)
 
-      // 移動確率: テンポが安定しているほど積極的に動く
-      const moveProb = 0.30 + conf * 0.45 + S.accMag * 0.18;
-      if (Math.random() < moveProb) {
-        // confidence が高いとき: 大きなステップ(跳躍)も許可
-        const bigStep  = Math.random() < 0.25 + conf * 0.25;
-        const step     = bigStep ? 2 : 1;
-        const dir      = Math.random() < 0.58 ? 1 : -1;  // 少し上昇傾向
-        fueFreqIdx    += dir * step;
-        fueFreqIdx     = Math.max(6, Math.min(YO.length - 1, fueFreqIdx));
-      }
+    function advanceLead() {
+      const chord = _currentChord || CHORDS.G;
+      const lead  = chord.lead;
+      const conf  = tempoDetector.effectiveConfidence();
 
-      const freq = YO[fueFreqIdx];
-      if (fueObj && audioCtx) {
-        const t = audioCtx.currentTime;
-        // テンポが速いほどポルタメントも短く（切れ味が出る）
-        const glide = Math.max(0.08, 0.42 - conf * 0.28);
-        fueObj.fueOsc.frequency.linearRampToValueAtTime(freq, t + glide);
-        fueObj.breathFilt.frequency.linearRampToValueAtTime(freq * 2.2, t + glide * 0.6);
-
-        // 第2笛（4度上でハーモニー）
-        if (fue2Obj) {
-          const f2idx = Math.max(6, Math.min(fueFreqIdx + 3, YO.length - 1));
-          fue2Obj.fueOsc.frequency.linearRampToValueAtTime(YO[f2idx], t + glide * 1.3);
-          fue2Obj.breathFilt.frequency.linearRampToValueAtTime(YO[f2idx] * 2.1, t + glide * 0.8);
+      // 休符明けに新しいフレーズを開始
+      if (phraseQueue <= 0) {
+        // フレーズ長: confidence が高いほど長い (1〜4音)
+        phraseQueue = 1 + Math.floor(Math.random() * (1.5 + conf * 2.5));
+        // フレーズ開始位置: コードトーンに着地 (lead[0..2])
+        leadStep = Math.floor(Math.random() * 3);
+      } else {
+        // フレーズ中: 隣接音にゆっくり移動
+        if (Math.random() < 0.75) {
+          leadStep += Math.random() < 0.55 ? 1 : -1;
+          leadStep = Math.max(0, Math.min(lead.length - 1, leadStep));
         }
       }
 
-      // 次の発音タイミング = tempoDetector が提案する間隔（人間的ゆらぎ込み）
-      const ms = tempoDetector.getFueInterval(S.accMag);
-      setTimeout(advanceFue, ms);
+      const freq = lead[leadStep];
+
+      if (audioCtx && _audioRefs?.guitarAmps) {
+        const amps = _audioRefs.guitarAmps;
+        // 音価: フレーズの最後は長め (歌詞の語尾感)
+        const isLast = phraseQueue === 1;
+        const dur    = isLast ? 0.7 + Math.random() * 0.5 : 0.35 + Math.random() * 0.25;
+        const lvel   = 0.40 + S.accMag * 0.30;
+        pickGuitar(audioCtx, amps, freq, lvel, dur);
+
+        // ハーモニー (フレーズの最後に 3度下のハモり、Oasis 二人ボーカル風)
+        if (isLast && conf > 0.30 && Math.random() < 0.35) {
+          const harmIdx = Math.max(0, leadStep - 2);
+          setTimeout(() => pickGuitar(audioCtx, amps, lead[harmIdx], lvel * 0.55, dur * 0.85), 25);
+        }
+      }
+
+      phraseQueue--;
+
+      // 次の音のタイミング: フレーズ中は短く、フレーズ間は休符を挟む
+      const baseMs = Math.max(220, tempoDetector.getFueInterval(S.accMag) * 0.55);
+      const ms = phraseQueue <= 0
+        ? baseMs * 2.5 + Math.random() * 400      // 休符 (1拍以上)
+        : baseMs;
+      setTimeout(advanceLead, ms | 0);
     }
-    advanceFue();
+    setTimeout(advanceLead, 1500);   // 進行が立ち上がってからリード開始
 
     updateLoop();
   }
@@ -1086,19 +1272,19 @@
       granEngine.spread  = 0.5 + S.accMag * 0.5;
     }
 
-    // 環境フィルター
-    a.envFilt.frequency.linearRampToValueAtTime(180 + S.mic * 650, t + 0.3);
-    a.envGain.gain.linearRampToValueAtTime(0.03 + S.mic * 0.11, t + 0.3);
+    // 環境ノイズ (アンプヒス) を明るさで揺らす
+    a.envFilt.frequency.linearRampToValueAtTime(400 + S.brightness * 1200, t + 0.3);
+    a.envGain.gain.linearRampToValueAtTime(0.018 + S.mic * 0.04, t + 0.3);
 
-    // 笛ブレス・ビブラート
-    if (fueObj) {
-      fueObj.breathGain.gain.linearRampToValueAtTime(0.05 + S.accMag * 0.18, t + 0.2);
-      fueObj.vibGain.gain.linearRampToValueAtTime(4 + S.accMag * 13, t + 0.3);
+    // ギタートーン (3チャンネルすべて): 動きが大きいほど高域開く (ワウ感)
+    if (a.guitarAmps) {
+      const tf = 2200 + S.accMag * 2400;
+      a.guitarAmps.forEach(amp => amp.tone.frequency.linearRampToValueAtTime(tf, t + 0.25));
     }
 
-    // リバーブウェット（観客が多いほど豊か）
+    // リバーブウェット (ロックは控えめ。観客が多いと少し増える)
     a.rvSend.gain.linearRampToValueAtTime(
-      0.3 + Math.min(audienceCount / 20, 1) * 0.45, t + 2
+      0.18 + Math.min(audienceCount / 20, 1) * 0.20, t + 2
     );
   }
 
@@ -1108,27 +1294,30 @@
     const crowd  = Math.min((s.audienceCount  || 0) / 20, 1);
     const energy = Math.min(s.avgAudienceEnergy || 0, 1);
     const t      = audioCtx.currentTime;
+    const a      = _audioRefs;
 
-    // 観客が盛り上がるほどリバーブが深まる（音が「返ってくる」感覚）
-    _audioRefs.rvSend.gain.linearRampToValueAtTime(
-      0.28 + crowd * 0.32 + energy * 0.22, t + 1.5
+    // 観客が盛り上がるほどリバーブが深まる
+    a.rvSend.gain.linearRampToValueAtTime(
+      0.18 + crowd * 0.18 + energy * 0.18, t + 1.5
     );
 
-    // 観客エネルギーで笛の音量・ビブラートが活発になる
-    if (fueObj) {
-      fueObj.fueGain.gain.linearRampToValueAtTime(
-        0.18 + energy * 0.16, t + 0.8
-      );
-      fueObj.vibGain.gain.linearRampToValueAtTime(
-        5 + energy * 14, t + 0.6
+    // 観客エネルギー → ギターのドライブを上げる(ファズ感が増す)
+    if (a.guitarBus) {
+      a.guitarBus.gain.linearRampToValueAtTime(
+        0.40 + energy * 0.30, t + 0.8
       );
     }
-    if (fue2Obj) {
-      fue2Obj.fueGain.gain.linearRampToValueAtTime(
-        0.07 + energy * 0.10, t + 0.9
-      );
-      fue2Obj.vibGain.gain.linearRampToValueAtTime(
-        4 + energy * 10, t + 0.7
+    // 3チャンネルそれぞれ少しずつズラした歪みカーブを再生成 (現在の曲の drive がベース)
+    if (a.guitarAmps) {
+      const offs = [-5, 0, -5];
+      a.guitarAmps.forEach((amp, i) => {
+        amp.dist.curve = makeDistortionCurve(_activeDrive + offs[i] + energy * 25);
+      });
+    }
+    // ベースは群衆が多いほど太く (低域ピーキングは不変、出力ゲインで)
+    if (a.bassBus) {
+      a.bassBus.gain.linearRampToValueAtTime(
+        0.62 + crowd * 0.18, t + 1.0
       );
     }
   }
