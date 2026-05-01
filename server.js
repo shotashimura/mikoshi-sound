@@ -24,8 +24,6 @@ app.get('/', (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html
 
 // ============================================================
 //  曲同期: 壁時計ベース
-//  Date.now() / SONG_DURATION_MS で全クライアントが同じ曲を独立計算できる
-//  ようにし、加えてサーバーから push でも揃える。
 // ============================================================
 const SONG_COUNT       = 4;
 const SONG_DURATION_MS = 210000;   // 3:30/曲
@@ -50,35 +48,43 @@ setInterval(() => {
 }, 250);
 
 // ============================================================
-//  接続管理: ロール無し。接続/切断のたびに人数を全員へ即配信。
+//  接続管理 + voiceIndex 採番
+//  ロール割当はクライアント側でラウンドロビンする（人数変動でも全員が
+//  同じ計算をして同じ役を導く）。サーバーは「誰が居るか」を伝えるだけ。
 // ============================================================
-let connectedCount = 0;
+const clients = new Map();   // socketId -> { voiceIndex }
+let _voiceCounter = 0;
 
-const broadcastCount = () => {
-  io.emit('world_state', { connectedCount, serverNow: Date.now() });
+const clientsPayload = () => Array.from(clients.entries())
+  .map(([id, c]) => ({ id, voiceIndex: c.voiceIndex }))
+  .sort((a, b) => a.voiceIndex - b.voiceIndex);
+
+const broadcastClients = () => {
+  io.emit('clients_update', { clients: clientsPayload(), serverNow: Date.now() });
 };
 
 io.on('connection', (socket) => {
-  connectedCount++;
-  console.log(`[+] ${socket.id} (count=${connectedCount})`);
+  const voiceIndex = _voiceCounter++;
+  clients.set(socket.id, { voiceIndex });
+  console.log(`[+] ${socket.id} vi=${voiceIndex} (count=${clients.size})`);
 
-  // 接続直後: 現在の曲と人数を即送信(mid-song でもすぐ揃う)
+  socket.emit('me', { id: socket.id, voiceIndex });
   socket.emit('song_change', {
     songIdx:   computeSongIdx(),
     startedAt: computeSongStartTs(),
     serverNow: Date.now(),
   });
-  broadcastCount();
+  broadcastClients();
 
-  // 時刻同期 RPC: クライアントが Christian's algorithm で server オフセットを推定
+  // Christian's algorithm 用の即時 ack
   socket.on('time_sync', (_clientT0, ack) => {
     if (typeof ack === 'function') ack(Date.now());
   });
 
   socket.on('disconnect', () => {
-    connectedCount = Math.max(0, connectedCount - 1);
-    broadcastCount();
-    console.log(`[-] ${socket.id} (count=${connectedCount})`);
+    clients.delete(socket.id);
+    broadcastClients();
+    console.log(`[-] ${socket.id} (count=${clients.size})`);
   });
 });
 

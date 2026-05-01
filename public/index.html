@@ -47,6 +47,12 @@
       color: rgba(255,220,100,0.85);
       letter-spacing: 0.15em;
     }
+    #role-line {
+      margin-top: 0.4rem;
+      font-size: 0.7rem;
+      color: rgba(255,220,100,0.7);
+      letter-spacing: 0.15em;
+    }
     #song-name {
       position: fixed; top: 1rem; left: 50%; transform: translateX(-50%);
       z-index: 50; font-size: 0.7rem; letter-spacing: 0.4em;
@@ -57,7 +63,10 @@
 <body>
   <canvas id="fx"></canvas>
   <div id="song-name"></div>
-  <div id="hud"><div class="count" id="count">— 接続中 —</div><div id="layers"></div></div>
+  <div id="hud">
+    <div class="count" id="count">— 接続中 —</div>
+    <div id="role-line"></div>
+  </div>
 
   <div id="tap">
     <div class="kanji">神輿</div>
@@ -69,8 +78,7 @@
   'use strict';
 
   // ============================================================
-  //  G メジャーコード辞書 (Oasis アンセム仕様)
-  //  voicing(ストローク用) / bassNotes(ベース歩き用) / lead(リード音域)
+  //  G メジャーコード辞書
   // ============================================================
   const CHORDS = {
     G:     { bassNotes: [49.00, 73.42, 98.00, 123.47],   voicing: [196.00, 246.94, 293.66, 392.00, 493.88], lead: [329.63, 392.00, 440.00, 493.88, 587.33, 659.26] },
@@ -90,59 +98,77 @@
   ];
 
   // ============================================================
+  //  ロール定義 (端末分散オーケストラ)
+  //  ROLES の優先順位 = ラウンドロビン分配の順序。
+  //  接続クライアント i は ROLES[r % n] が r % n === i のロールを担当。
+  //  人数 n=1 なら全ロール、n>=6 なら原則 1 ロールずつ。
+  // ============================================================
+  const ROLES = ['DRUMS', 'BASS', 'RHYTHM', 'LEAD', 'HARMONY', 'PERCUSSION'];
+  const ROLE_COLOR = {
+    DRUMS:      '#ff6a3c',   // 赤橙
+    BASS:       '#a060ff',   // 紫
+    RHYTHM:     '#ffc640',   // 黄
+    LEAD:       '#52d3ff',   // 水色
+    HARMONY:    '#7eee8c',   // 緑
+    PERCUSSION: '#ff7eb0',   // ピンク
+  };
+
+  // ============================================================
   //  グローバル状態
   // ============================================================
   let audioCtx        = null;
-  let connectedCount  = 1;
-  let serverOffsetMs  = 0;            // serverNow ≈ Date.now() + serverOffsetMs
-  let audioCtxStartWallMs = 0;        // audioCtx.currentTime=0 の壁時計時刻
+  let serverOffsetMs  = 0;
+  let audioCtxStartWallMs = 0;
 
   let _activeSongIdx     = 0;
   let _songStartedAtServer = 0;
   let _scheduledThroughMeasure = -1;
 
-  // 各 tier (人数閾値) の現在ゲイン (0..1, 滑らかに変化させる)
-  // 0: 常時 / 1: 2人〜 / 2: 3人〜 / ... / 7: 8人〜
-  const TIER_THRESHOLD = [1, 2, 3, 4, 5, 6, 7, 8];
-  const tierLevel  = new Array(8).fill(0);
-  const tierTarget = new Array(8).fill(0);
-  tierLevel[0] = 1;  // tier 0 は最初から少しでもならないと聞こえない
+  // 接続中クライアント情報 (サーバーから clients_update で届く)
+  let myId = null;
+  let clientsList = [];   // [{id, voiceIndex}]
+  // 自分の担当ロールを示す 0..1 のレベル (滑らかにフェード)
+  const roleLevel  = Object.fromEntries(ROLES.map((r) => [r, r === 'DRUMS' ? 1 : 0]));
+  const roleTarget = Object.fromEntries(ROLES.map((r) => [r, 0]));
 
-  // ビジュアル: kick が鳴ったタイミングを保持して画面を脈動させる
-  let lastKickPulse = 0;
+  // どのクライアントがどのロールを担当しているか (ビジュアル用)
+  // socketId -> { roles: string[], pulses: { ROLE: lastMs } }
+  const clientMeta = new Map();
+  // 描画位置 (滑らかに目標へ動く)
+  const clientPositions = new Map();
 
   // ============================================================
   //  Socket.io
   // ============================================================
   const socket = io({ transports: ['websocket'] });
 
+  socket.on('me', ({ id }) => { myId = id; });
+
   socket.on('song_change', ({ songIdx, startedAt, serverNow }) => {
     if (typeof serverNow === 'number') {
-      // 即時オフセット推定 (1 サンプル) — 後で time_sync で精緻化
       serverOffsetMs = serverNow - Date.now();
     }
     _activeSongIdx = ((songIdx % SONGS.length) + SONGS.length) % SONGS.length;
     _songStartedAtServer = startedAt;
-    _scheduledThroughMeasure = -1;   // スケジューラを再初期化
+    _scheduledThroughMeasure = -1;
 
     document.getElementById('song-name').textContent = SONGS[_activeSongIdx].name;
-    if (_g) applySongTone(_activeSongIdx);   // 既に音響起動済みなら音色も追従
+    if (_g) applySongTone(_activeSongIdx);
   });
 
-  socket.on('world_state', ({ connectedCount: c, serverNow }) => {
+  socket.on('clients_update', ({ clients, serverNow }) => {
     if (typeof serverNow === 'number') {
-      // 軽い補正 (RTT 不明だが片道分のゆらぎは許容)
       const sample = serverNow - Date.now();
       serverOffsetMs = serverOffsetMs * 0.85 + sample * 0.15;
     }
-    connectedCount = Math.max(1, c | 0);
-    updateTierTargets();
+    clientsList = clients || [];
+    recomputeRoles();
+    refreshClientMeta();
     updateHud();
   });
 
   // ============================================================
-  //  時刻同期: Christian's algorithm を 5 秒ごと
-  //  RTT/2 ≈ 片道遅延 と仮定し、最低 RTT のサンプルから offset を更新
+  //  時刻同期
   // ============================================================
   let bestRtt = Infinity;
   function syncTime() {
@@ -153,7 +179,6 @@
       const rtt = t1 - t0;
       const offset = serverT - (t0 + rtt / 2);
       if (rtt < bestRtt * 1.5 || rtt < 80) {
-        // 良サンプルは強めに、悪サンプルは弱めに反映
         const w = rtt < bestRtt ? 0.5 : 0.15;
         serverOffsetMs = serverOffsetMs * (1 - w) + offset * w;
         if (rtt < bestRtt) bestRtt = rtt;
@@ -163,17 +188,79 @@
   setInterval(syncTime, 5000);
 
   // ============================================================
-  //  タップで開始 (autoplay policy 対策)
+  //  ロール計算 (全端末で同じアルゴリズム)
+  //  ──────────────────────────────────────────────
+  //  clientsList は voiceIndex 昇順。自分の位置 myI と人数 n から
+  //   r % n === myI を満たすロールを担当。
+  //  myI が ROLES.length より大きい場合は myI % ROLES.length で重複担当。
+  // ============================================================
+  function recomputeRoles() {
+    if (!myId) {
+      for (const r of ROLES) roleTarget[r] = 0;
+      return;
+    }
+    const n = clientsList.length;
+    const myI = clientsList.findIndex((c) => c.id === myId);
+    for (const r of ROLES) roleTarget[r] = 0;
+    if (myI < 0 || n === 0) return;
+
+    const mine = new Set();
+    for (let r = 0; r < ROLES.length; r++) {
+      if (r % n === myI) mine.add(ROLES[r]);
+    }
+    if (mine.size === 0) mine.add(ROLES[myI % ROLES.length]);
+    for (const r of mine) roleTarget[r] = 1;
+  }
+
+  function rolesForVoiceIndexInList(voiceIndex) {
+    const n = clientsList.length;
+    const i = clientsList.findIndex((c) => c.voiceIndex === voiceIndex);
+    if (i < 0 || n === 0) return [];
+    const mine = [];
+    for (let r = 0; r < ROLES.length; r++) {
+      if (r % n === i) mine.push(ROLES[r]);
+    }
+    if (mine.length === 0) mine.push(ROLES[i % ROLES.length]);
+    return mine;
+  }
+
+  function refreshClientMeta() {
+    const seen = new Set();
+    for (const c of clientsList) {
+      seen.add(c.id);
+      const roles = rolesForVoiceIndexInList(c.voiceIndex);
+      const prev = clientMeta.get(c.id);
+      clientMeta.set(c.id, {
+        voiceIndex: c.voiceIndex,
+        roles,
+        pulses: prev?.pulses || {},
+      });
+    }
+    for (const id of Array.from(clientMeta.keys())) {
+      if (!seen.has(id)) clientMeta.delete(id);
+    }
+  }
+
+  // ============================================================
+  //  タップで開始
   // ============================================================
   document.getElementById('tap').addEventListener('pointerdown', async () => {
     document.getElementById('tap').classList.add('gone');
     await initAudio();
-    // サーバーから既に songIdx 受信済みなら startScheduler が即動く
   }, { once: true });
 
   // ============================================================
-  //  ユーティリティ: 合成インパルスレスポンス・ディストーションカーブ
+  //  ユーティリティ
   // ============================================================
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
   function createConvReverb(ctx, duration, decay) {
     const sr  = ctx.sampleRate;
     const len = Math.floor(sr * duration);
@@ -220,7 +307,7 @@
   }
 
   // ============================================================
-  //  ドラム合成 (when は audioCtx 絶対時刻)
+  //  ドラム合成
   // ============================================================
   function hitKick(out, when, vel) {
     const ctx = audioCtx;
@@ -234,7 +321,6 @@
     osc.connect(env); env.connect(out);
     osc.start(when); osc.stop(when + 0.45);
 
-    // ビーターのクリック
     const sr = ctx.sampleRate;
     const cb = ctx.createBuffer(1, Math.floor(sr * 0.012), sr);
     const cd = cb.getChannelData(0);
@@ -246,10 +332,6 @@
     cg.gain.exponentialRampToValueAtTime(0.0001, when + 0.012);
     cs.connect(cf); cf.connect(cg); cg.connect(out);
     cs.start(when); cs.stop(when + 0.013);
-
-    // ビジュアル: kick の壁時計時刻を記録 (ペース UI 用)
-    const wallMs = (when - audioCtx.currentTime) * 1000 + Date.now();
-    setTimeout(() => { lastKickPulse = performance.now(); }, Math.max(0, wallMs - Date.now()));
   }
 
   function hitSnare(out, when, vel) {
@@ -341,7 +423,7 @@
   }
 
   // ============================================================
-  //  ベース (saw + sub sine + LPF アタックフィルタ)
+  //  ベース・ギター
   // ============================================================
   function playBass(out, when, freq, vel, dur = 0.45) {
     const ctx = audioCtx;
@@ -375,9 +457,6 @@
     sub.start(when); sub.stop(when + dur + 0.05);
   }
 
-  // ============================================================
-  //  ギター (Karplus-Strong 3声トリプル + ストローク)
-  // ============================================================
   function pickGuitar(amps, when, freq, vel, dur = 0.95) {
     const ctx = audioCtx;
     const sr  = ctx.sampleRate;
@@ -398,7 +477,6 @@
       src.start(start); src.stop(start + dur + 0.05);
     });
 
-    // ピックアタック
     const pkB = ctx.createBuffer(1, Math.floor(sr * 0.008), sr);
     const pkD = pkB.getChannelData(0);
     for (let i = 0; i < pkD.length; i++) pkD[i] = Math.random() * 2 - 1;
@@ -436,9 +514,9 @@
   }
 
   // ============================================================
-  //  音響グラフ初期化
+  //  音響グラフ
   // ============================================================
-  let _g = null;   // graph refs
+  let _g = null;
 
   async function initAudio() {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({
@@ -446,7 +524,6 @@
     });
     if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-    // audioCtx.currentTime=0 の壁時計時刻 (server オフセット込みで考えるための基準)
     audioCtxStartWallMs = Date.now() - audioCtx.currentTime * 1000;
 
     const master = audioCtx.createGain();
@@ -467,7 +544,6 @@
     const rvSend = audioCtx.createGain(); rvSend.gain.value = 0.30;
     instrBus.connect(rvSend); rvSend.connect(convRev);
 
-    // ─── ギター 3 アンプ (L/C/R) ───
     const song = SONGS[_activeSongIdx];
     const guitarAmps = [
       makeGuitarAmp(audioCtx, -0.7, song.drive - 5),
@@ -479,7 +555,6 @@
     const guitarDuck = audioCtx.createGain(); guitarDuck.gain.value = 1.0;
     guitarBus.connect(guitarDuck); guitarDuck.connect(instrBus);
 
-    // ─── ベース ───
     const bassAmp = audioCtx.createGain(); bassAmp.gain.value = 1.0;
     const bassToneFilt = audioCtx.createBiquadFilter();
     bassToneFilt.type = 'lowpass'; bassToneFilt.frequency.value = 850; bassToneFilt.Q.value = 1.0;
@@ -491,19 +566,16 @@
     const bassDuck = audioCtx.createGain(); bassDuck.gain.value = 1.0;
     bassBus.connect(bassDuck); bassDuck.connect(instrBus);
 
-    // ─── ドラム ───
     const drumBus = audioCtx.createGain(); drumBus.gain.value = 0.85;
     drumBus.connect(instrBus);
 
-    // ─── ドローン (G1 サブベース) ───
     const droneOsc = audioCtx.createOscillator();
     droneOsc.type  = 'triangle';
     droneOsc.frequency.value = song.tonic;
-    const droneGain = audioCtx.createGain(); droneGain.gain.value = 0;  // tier 3 で立ち上げ
+    const droneGain = audioCtx.createGain(); droneGain.gain.value = 0;
     droneOsc.connect(droneGain); droneGain.connect(bassAmp);
     droneOsc.start();
 
-    // ─── アンプヒス (環境ノイズ) ───
     const envBuf = audioCtx.createBuffer(1, audioCtx.sampleRate * 4, audioCtx.sampleRate);
     const ed = envBuf.getChannelData(0);
     for (let i = 0; i < ed.length; i++) ed[i] = Math.random() * 2 - 1;
@@ -525,18 +597,17 @@
 
     applySongTone(_activeSongIdx);
 
-    // 起動アクセント
+    // 起動アクセント (ロール無関係に1発鳴らす — 操作開始の合図)
     const t0 = audioCtx.currentTime + 0.05;
-    hitKick(drumBus, t0, 0.6);
-    hitCrash(drumBus, t0, 0.45);
-    strumChord(guitarAmps, t0, CHORDS.G.voicing, 0.55, 1.4, true);
+    hitKick(drumBus, t0, 0.55);
+    hitCrash(drumBus, t0, 0.40);
+    strumChord(guitarAmps, t0, CHORDS.G.voicing, 0.50, 1.4, true);
 
     startScheduler();
-    startTierLerper();
+    startRoleLerper();
     startHudLoop();
   }
 
-  // ─── 曲のトーンをアンプに反映 ───
   function applySongTone(idx) {
     if (!_g) return;
     const song = SONGS[idx];
@@ -550,7 +621,6 @@
     _g.droneOsc.frequency.linearRampToValueAtTime(song.tonic, t + 1.2);
   }
 
-  // ─── kick → guitar/bass duck ───
   function duckSidechain(when, amount = 0.45, recoverMs = 180) {
     if (!_g) return;
     [_g.guitarDuck, _g.bassDuck].forEach((g) => {
@@ -561,36 +631,26 @@
     });
   }
 
-  // ============================================================
-  //  時刻変換: server-wall-ms → audioCtx 絶対時刻 (秒)
-  // ============================================================
   function audioTimeFromServerWall(serverWallMs) {
     const localWallMs = serverWallMs - serverOffsetMs;
     return (localWallMs - audioCtxStartWallMs) / 1000;
   }
 
   // ============================================================
-  //  Tier Lerper: 接続人数に応じてレイヤーを滑らかに上下
+  //  ロールレベル lerper
   // ============================================================
-  function updateTierTargets() {
-    for (let i = 0; i < TIER_THRESHOLD.length; i++) {
-      tierTarget[i] = connectedCount >= TIER_THRESHOLD[i] ? 1 : 0;
-    }
-  }
-
-  function startTierLerper() {
+  function startRoleLerper() {
     function tick() {
-      for (let i = 0; i < tierLevel.length; i++) {
-        // 約 1.2 秒で目標へ (60fps × 0.012)
-        tierLevel[i] += (tierTarget[i] - tierLevel[i]) * 0.012;
+      for (const r of ROLES) {
+        roleLevel[r] += (roleTarget[r] - roleLevel[r]) * 0.012;
       }
-      // ドローンとリバーブ送りを tier に追従させる
       if (_g) {
         const t = audioCtx.currentTime;
-        _g.droneGain.gain.linearRampToValueAtTime(0.06 * tierLevel[3], t + 0.2);
-        _g.rvSend.gain.linearRampToValueAtTime(
-          0.18 + 0.10 * tierLevel[5] + 0.08 * tierLevel[7], t + 0.4
-        );
+        // ドローン: BASS ロール持ちなら鳴らす
+        _g.droneGain.gain.linearRampToValueAtTime(0.06 * roleLevel.BASS, t + 0.2);
+        // リバーブ: 自分のロールがリッチなほど深め
+        const wetBoost = roleLevel.LEAD * 0.08 + roleLevel.HARMONY * 0.06 + roleLevel.PERCUSSION * 0.04;
+        _g.rvSend.gain.linearRampToValueAtTime(0.18 + wetBoost, t + 0.4);
       }
       requestAnimationFrame(tick);
     }
@@ -598,21 +658,32 @@
   }
 
   // ============================================================
-  //  ビート・スケジューラ (lookahead 250ms / tick 25ms)
-  //  サーバー壁時計に揃えた measureN を絶対時刻でキューイングする。
+  //  ロール発音パルス (ビジュアル用)
+  //  audioCtxTime に到達したら、そのロール担当の clientPulses を更新する
   // ============================================================
-  const LOOKAHEAD_S      = 0.30;
+  function pulseRoleAt(role, when) {
+    const wallMs = (when - audioCtx.currentTime) * 1000 + Date.now();
+    const delay = Math.max(0, wallMs - Date.now());
+    setTimeout(() => {
+      const now = performance.now();
+      for (const [id, meta] of clientMeta) {
+        if (meta.roles.includes(role)) {
+          meta.pulses[role] = now;
+        }
+      }
+    }, delay);
+  }
+
+  // ============================================================
+  //  ビート・スケジューラ (lookahead 250ms / tick 25ms)
+  // ============================================================
+  const LOOKAHEAD_S = 0.30;
   const SCHED_INTERVAL_MS = 25;
 
-  // フレーズ用の閉包変数 (リード)
-  let _leadStep = 0;
-  let _leadPhraseQueue = 0;
-
   function startScheduler() {
-    let timer = null;
     const tick = () => {
       try { scheduleAhead(); } catch (e) { console.warn('[sched]', e); }
-      timer = setTimeout(tick, SCHED_INTERVAL_MS);
+      setTimeout(tick, SCHED_INTERVAL_MS);
     };
     tick();
   }
@@ -620,17 +691,14 @@
   function scheduleAhead() {
     if (!_g || !audioCtx) return;
     const song = SONGS[_activeSongIdx];
-    const bpm  = song.bpmBase;
-    const sixteenthMs = 60000 / bpm / 4;
+    const sixteenthMs = 60000 / song.bpmBase / 4;
     const measureMs   = sixteenthMs * 16;
 
     const now = audioCtx.currentTime;
     const horizon = now + LOOKAHEAD_S;
 
-    // 現在の (server 壁時計上の) 経過 ms から measure index を逆算し、
-    // _scheduledThroughMeasure が -1 ならそこから先をキューイング開始
-    const serverNowMs = Date.now() + serverOffsetMs;
     if (_scheduledThroughMeasure < 0) {
+      const serverNowMs = Date.now() + serverOffsetMs;
       const elapsedMs = serverNowMs - _songStartedAtServer;
       _scheduledThroughMeasure = Math.max(-1, Math.floor(elapsedMs / measureMs) - 1);
     }
@@ -640,14 +708,11 @@
       const measureWallMs = _songStartedAtServer + measureN * measureMs;
       const measureAudioT = audioTimeFromServerWall(measureWallMs);
       if (measureAudioT > horizon) break;
-
-      // 過去すぎる小節はスキップ (急なジャンプや起動直後)
       if (measureAudioT < now - 0.05) {
         _scheduledThroughMeasure = measureN;
         measureN++;
         continue;
       }
-
       scheduleMeasure(measureN, measureAudioT, sixteenthMs / 1000, song);
       _scheduledThroughMeasure = measureN;
       measureN++;
@@ -659,17 +724,27 @@
     const guitarAmps = _g.guitarAmps;
     const bassAmp    = _g.bassAmp;
 
+    // 全端末で同じ乱択を得るために measure シードの RNG を生成
+    const rng = mulberry32(_activeSongIdx * 100003 + measureN * 7919);
+
     const chordName = song.progression[measureN % song.progression.length];
     const chord     = CHORDS[chordName];
     const feel      = song.drumFeel;
 
-    // 基本ベロシティ (1人だと弱め、人が増えると上がる)
-    const base = 0.34 + Math.min(connectedCount, 8) * 0.025;
+    const n = clientsList.length || 1;
+    const base = 0.36 + Math.min(n, 8) * 0.020;
+
+    // 担当ロールでゲートしつつ、サイドチェイン/ビジュアルパルスは
+    // 全端末同期で行う(担当外でも視覚は鳴る)。
+    const playD = roleLevel.DRUMS;
+    const playB = roleLevel.BASS;
+    const playR = roleLevel.RHYTHM;
+    const playP = roleLevel.PERCUSSION;
 
     for (let s = 0; s < 16; s++) {
       const tStep = t0 + sixteenthSec * s;
 
-      // ── ハイハット (tier 2: n>=3) ──
+      // ── ハイハット (DRUMS) ──
       let hatStep = false, hatVel = 0, hatOpen = false;
       if (feel === 'driving') {
         hatStep = true;
@@ -680,149 +755,164 @@
       } else {
         hatStep = (s % 2 === 0);
         hatVel = base * (s % 4 === 0 ? 0.85 : 0.55);
-        hatOpen = (s === 14 && Math.random() < 0.30);
+        hatOpen = (s === 14 && rng() < 0.30);
       }
       if (hatStep) {
-        const v = hatVel * tierLevel[2];
+        const v = hatVel * playD;
         if (v > 0.01) hitHihat(drumBus, tStep, v, hatOpen);
       }
 
-      // ── キック (tier 0: 常時) ──
+      // ── キック (DRUMS) ──
       let kickHere = false;
       if (feel === 'driving') {
-        kickHere = s === 0 || s === 6 || s === 8 || (s === 10 && Math.random() < 0.5);
+        kickHere = s === 0 || s === 6 || s === 8 || (s === 10 && rng() < 0.5);
       } else if (feel === 'half') {
         kickHere = s === 0 || s === 10;
       } else {
-        kickHere = s === 0 || s === 8 || (s === 6 && Math.random() < 0.25);
+        kickHere = s === 0 || s === 8 || (s === 6 && rng() < 0.25);
       }
       if (kickHere) {
-        const v = base * tierLevel[0];
-        if (v > 0.01) {
-          hitKick(drumBus, tStep, v);
-          duckSidechain(tStep);
-        }
+        // 全端末でビジュアルパルス & サイドチェイン (ローカルにギター/ベースがあれば効く)
+        pulseRoleAt('DRUMS', tStep);
+        duckSidechain(tStep);
+        const v = base * playD;
+        if (v > 0.01) hitKick(drumBus, tStep, v);
       }
 
-      // ── スネア (tier 1: n>=2) ──
+      // ── スネア (DRUMS) ──
       let snareHere = false;
       if (feel === 'half') snareHere = s === 8;
       else snareHere = s === 4 || s === 12;
       if (snareHere) {
-        const v = base * 0.85 * tierLevel[1];
+        const v = base * 0.85 * playD;
         if (v > 0.01) hitSnare(drumBus, tStep, v);
       }
-      // ゴーストスネア (tier 7: n>=8)
-      if (feel === 'anthemic' && (s === 10 || s === 14) && Math.random() < 0.30) {
-        const v = base * 0.30 * tierLevel[7];
-        if (v > 0.01) hitSnare(drumBus, tStep, v);
+      // ゴーストスネア (PERCUSSION)
+      if (feel === 'anthemic' && (s === 10 || s === 14) && rng() < 0.30) {
+        const v = base * 0.30 * playP;
+        if (v > 0.01) {
+          hitSnare(drumBus, tStep, v);
+          pulseRoleAt('PERCUSSION', tStep);
+        }
       }
 
-      // ── ベース 8分歩き (tier 0) ──
+      // ── ベース 8分歩き (BASS) ──
       if (s % 2 === 0) {
         const beatN = s >> 1;
         const bIdx  = beatN % chord.bassNotes.length;
         const bFreq = chord.bassNotes[bIdx];
         const bvel  = base * (s === 0 ? 0.80 : (s % 4 === 0 ? 0.65 : 0.50));
-        const v = bvel * tierLevel[0];
-        if (v > 0.01) playBass(bassAmp, tStep, bFreq, v, sixteenthSec * 1.6);
-      }
-
-      // ── 主ストローク 1拍目 (tier 0) ──
-      if (s === 0) {
-        const v = base * 0.90 * tierLevel[0];
-        if (v > 0.01) strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 12, true);
-      }
-
-      // ── 3拍目アップストローク (tier 4: n>=5) ──
-      if (s === 8) {
-        const v = base * 0.55 * tierLevel[4];
-        if (v > 0.01) strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 6, false);
-      }
-
-      // ── 8分裏ジャカジャカ (tier 4) ──
-      if ((s === 4 || s === 12) && Math.random() < 0.50) {
-        const v = base * 0.30 * tierLevel[4];
-        if (v > 0.01) strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 4, true);
-      }
-
-      // ── タムフィル (tier 7) ──
-      if (measureN % 4 === 3 && s >= 12 && s % 2 === 0 && Math.random() < 0.55) {
-        const v = base * 0.70 * tierLevel[7];
+        const v = bvel * playB;
         if (v > 0.01) {
-          const tomFreq = 110 + (s - 12) * 22;
-          hitTom(drumBus, tStep, tomFreq, v);
+          playBass(bassAmp, tStep, bFreq, v, sixteenthSec * 1.6);
+          if (s === 0) pulseRoleAt('BASS', tStep);
         }
       }
 
-      // ── オープンハット強調 (tier 7) ──
-      if (s === 7 && Math.random() < 0.25) {
-        const v = base * 0.55 * tierLevel[7];
+      // ── 主ストローク 1拍目 (RHYTHM) ──
+      if (s === 0) {
+        const v = base * 0.90 * playR;
+        if (v > 0.01) {
+          strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 12, true);
+          pulseRoleAt('RHYTHM', tStep);
+        }
+      }
+      // ── 3拍目アップストローク (RHYTHM) ──
+      if (s === 8) {
+        const v = base * 0.55 * playR;
+        if (v > 0.01) {
+          strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 6, false);
+          pulseRoleAt('RHYTHM', tStep);
+        }
+      }
+      // ── 8分裏ジャカジャカ (RHYTHM) ──
+      if ((s === 4 || s === 12) && rng() < 0.50) {
+        const v = base * 0.30 * playR;
+        if (v > 0.01) strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 4, true);
+      }
+
+      // ── タムフィル (PERCUSSION) ──
+      if (measureN % 4 === 3 && s >= 12 && s % 2 === 0 && rng() < 0.55) {
+        const v = base * 0.70 * playP;
+        if (v > 0.01) {
+          const tomFreq = 110 + (s - 12) * 22;
+          hitTom(drumBus, tStep, tomFreq, v);
+          pulseRoleAt('PERCUSSION', tStep);
+        }
+      }
+      // ── オープンハット強調 (PERCUSSION) ──
+      if (s === 7 && rng() < 0.25) {
+        const v = base * 0.55 * playP;
         if (v > 0.01) hitHihat(drumBus, tStep, v, true);
       }
     }
 
-    // クラッシュ: 進行ループ頭 (tier 6: n>=7)
+    // クラッシュ: 進行ループ頭 (PERCUSSION)
     if (measureN % song.progression.length === 0) {
-      const v = base * 0.6 * tierLevel[6];
-      if (v > 0.01) hitCrash(drumBus, t0, v);
+      const v = base * 0.6 * playP;
+      if (v > 0.01) {
+        hitCrash(drumBus, t0, v);
+        pulseRoleAt('PERCUSSION', t0);
+      }
     }
 
-    // ── リード/ハーモニーは小節をまたいだフレーズなので
-    //   1 小節分のリード音をこの小節内に配置する ──
-    scheduleLeadForMeasure(measureN, t0, sixteenthSec, chord);
+    scheduleLeadForMeasure(measureN, t0, sixteenthSec, chord, rng);
   }
 
-  function scheduleLeadForMeasure(measureN, t0, sixteenthSec, chord) {
-    const guitarAmps = _g.guitarAmps;
+  function scheduleLeadForMeasure(measureN, t0, sixteenthSec, chord, rng) {
     const lead = chord.lead;
     if (!lead) return;
+    if (roleLevel.LEAD < 0.02 && roleLevel.HARMONY < 0.02) return;
 
-    // tier 5 (n>=6) でリード単音を 1 小節に 3〜5 音入れる
-    if (tierLevel[5] < 0.02) return;
+    const noteCount = 3 + Math.floor(rng() * 2);
+    let leadStep = Math.floor(rng() * 3);
 
-    const noteCount = 2 + ((measureN % 3 === 0) ? 1 : 2);  // 3〜4 音
     for (let i = 0; i < noteCount; i++) {
       const stepIdx = 1 + Math.floor((i / noteCount) * 14);
-      const tStep   = t0 + sixteenthSec * stepIdx;
+      const tStep = t0 + sixteenthSec * stepIdx;
 
-      // フレーズ内の動き
-      if (_leadPhraseQueue <= 0) {
-        _leadPhraseQueue = 2 + Math.floor(Math.random() * 3);
-        _leadStep = Math.floor(Math.random() * 3);
-      } else if (Math.random() < 0.7) {
-        _leadStep += Math.random() < 0.55 ? 1 : -1;
-        _leadStep = Math.max(0, Math.min(lead.length - 1, _leadStep));
+      if (i > 0 && rng() < 0.7) {
+        leadStep += rng() < 0.55 ? 1 : -1;
+        leadStep = Math.max(0, Math.min(lead.length - 1, leadStep));
       }
-      const freq = lead[_leadStep];
-      const isLast = _leadPhraseQueue === 1;
-      const dur = isLast ? 0.7 + Math.random() * 0.4 : 0.35 + Math.random() * 0.25;
-      const lvel = (0.40 + Math.min(connectedCount, 8) * 0.02) * tierLevel[5];
+      const freq = lead[leadStep];
+      const isLast = i === noteCount - 1;
+      const dur = isLast ? 0.7 + rng() * 0.4 : 0.35 + rng() * 0.25;
 
-      if (lvel > 0.01) pickGuitar(guitarAmps, tStep, freq, lvel, dur);
+      const baseVel = 0.40 + Math.min(clientsList.length || 1, 8) * 0.02;
 
-      // ── ハーモニー 3度上 (tier 6: n>=7) ──
-      if (isLast && tierLevel[6] > 0.05 && Math.random() < 0.4) {
-        const harmIdx = Math.max(0, _leadStep - 2);
-        const hvel = lvel * 0.55 * tierLevel[6];
+      // LEAD ロール担当者だけが鳴らす
+      const lvel = baseVel * roleLevel.LEAD;
+      if (lvel > 0.01) {
+        pickGuitar(_g.guitarAmps, tStep, freq, lvel, dur);
+        pulseRoleAt('LEAD', tStep);
+      }
+
+      // HARMONY ロール: フレーズ最後で 3度下を重ねる
+      if (isLast && rng() < 0.45) {
+        const harmIdx = Math.max(0, leadStep - 2);
+        const hvel = baseVel * 0.55 * roleLevel.HARMONY;
         if (hvel > 0.01) {
-          pickGuitar(guitarAmps, tStep + 0.025, lead[harmIdx], hvel, dur * 0.85);
+          pickGuitar(_g.guitarAmps, tStep + 0.025, lead[harmIdx], hvel, dur * 0.85);
+          pulseRoleAt('HARMONY', tStep + 0.025);
         }
       }
-      _leadPhraseQueue--;
     }
   }
 
   // ============================================================
-  //  HUD + ビジュアル
+  //  HUD
   // ============================================================
   function updateHud() {
     const c = document.getElementById('count');
-    const l = document.getElementById('layers');
-    if (c) c.textContent = `参加 ${connectedCount} 人`;
-    if (l) {
-      const active = TIER_THRESHOLD.filter(t => connectedCount >= t).length;
-      l.textContent = `レイヤー ${active}/${TIER_THRESHOLD.length}`;
+    const r = document.getElementById('role-line');
+    const n = clientsList.length || 0;
+    if (c) c.textContent = `参加 ${Math.max(n, 1)} 人`;
+    if (r) {
+      const mine = ROLES.filter((rr) => roleTarget[rr] > 0.5);
+      r.innerHTML = mine.length
+        ? '担当: ' + mine.map((rr) => `<span style="color:${ROLE_COLOR[rr]}">${rr}</span>`).join(' / ')
+        : '';
     }
   }
   updateHud();
@@ -832,7 +922,7 @@
   }
 
   // ============================================================
-  //  パーティクル + キックパルス
+  //  ビジュアル: 接続光点マップ + パーティクル
   // ============================================================
   const canvas = document.getElementById('fx');
   const ctx2d  = canvas.getContext('2d');
@@ -840,40 +930,115 @@
   const resize = () => { cw = canvas.width = innerWidth; ch = canvas.height = innerHeight; };
   resize(); addEventListener('resize', resize);
 
-  const particles = Array.from({ length: 110 }, () => ({
+  const particles = Array.from({ length: 80 }, () => ({
     x: Math.random(), y: Math.random(),
     vx: (Math.random() - 0.5) * 0.0003,
     vy: -(Math.random() * 0.0004 + 0.0001),
-    size: Math.random() * 2.4 + 0.5,
-    alpha: Math.random() * 0.6 + 0.15,
+    size: Math.random() * 2.0 + 0.4,
+    alpha: Math.random() * 0.5 + 0.1,
     hue: Math.random() * 30 + 25,
   }));
+
+  function layoutPositions() {
+    const cx = cw / 2, cy = ch / 2;
+    const n  = clientsList.length || 1;
+    const radius = Math.min(cw, ch) * (n === 1 ? 0 : Math.min(0.18 + n * 0.018, 0.34));
+    clientsList.forEach((c, i) => {
+      const angle = (i / Math.max(1, n)) * Math.PI * 2 - Math.PI / 2;
+      const tx = cx + Math.cos(angle) * radius;
+      const ty = cy + Math.sin(angle) * radius;
+      const prev = clientPositions.get(c.id) || { x: cx, y: cy };
+      clientPositions.set(c.id, {
+        x: prev.x + (tx - prev.x) * 0.06,
+        y: prev.y + (ty - prev.y) * 0.06,
+      });
+    });
+  }
+
+  function drawClientDots() {
+    const now = performance.now();
+    for (const c of clientsList) {
+      const meta = clientMeta.get(c.id);
+      if (!meta) continue;
+      const pos = clientPositions.get(c.id);
+      if (!pos) continue;
+
+      // 各ロールのパルス強度を合算
+      let pulse = 0;
+      let primaryRole = meta.roles[0] || 'DRUMS';
+      for (const r of meta.roles) {
+        const last = meta.pulses[r];
+        if (last) {
+          const since = now - last;
+          if (since < 250) pulse = Math.max(pulse, 1 - since / 250);
+        }
+      }
+
+      const isMe = c.id === myId;
+      const color = ROLE_COLOR[primaryRole] || '#ffffff';
+      const baseR = isMe ? 12 : 8;
+      const r = baseR + pulse * 14;
+
+      // ハロー
+      const grad = ctx2d.createRadialGradient(pos.x, pos.y, 0, pos.x, pos.y, r * 4);
+      grad.addColorStop(0, hexA(color, 0.45 + pulse * 0.45));
+      grad.addColorStop(1, hexA(color, 0));
+      ctx2d.fillStyle = grad;
+      ctx2d.beginPath(); ctx2d.arc(pos.x, pos.y, r * 4, 0, Math.PI * 2); ctx2d.fill();
+
+      // コア
+      ctx2d.fillStyle = color;
+      ctx2d.globalAlpha = 0.85;
+      ctx2d.beginPath(); ctx2d.arc(pos.x, pos.y, r * 0.55, 0, Math.PI * 2); ctx2d.fill();
+      ctx2d.globalAlpha = 1;
+
+      // 自分用リング
+      if (isMe) {
+        ctx2d.strokeStyle = hexA('#ffffff', 0.85);
+        ctx2d.lineWidth = 1.5;
+        ctx2d.beginPath(); ctx2d.arc(pos.x, pos.y, r * 0.95 + 4, 0, Math.PI * 2); ctx2d.stroke();
+      }
+
+      // 複数ロールを持つ場合は外周に色ドットを置く (副ロール表示)
+      if (meta.roles.length > 1) {
+        meta.roles.forEach((rr, i) => {
+          if (i === 0) return;
+          const a = (i / meta.roles.length) * Math.PI * 2;
+          const dx = pos.x + Math.cos(a) * (r * 0.95 + 9);
+          const dy = pos.y + Math.sin(a) * (r * 0.95 + 9);
+          ctx2d.fillStyle = ROLE_COLOR[rr];
+          ctx2d.globalAlpha = 0.7;
+          ctx2d.beginPath(); ctx2d.arc(dx, dy, 2.5, 0, Math.PI * 2); ctx2d.fill();
+          ctx2d.globalAlpha = 1;
+        });
+      }
+    }
+  }
+
+  function hexA(hex, alpha) {
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
 
   function drawFx() {
     requestAnimationFrame(drawFx);
     ctx2d.clearRect(0, 0, cw, ch);
 
-    // キックの脈動 (kick から 200ms 程度で減衰)
-    const since = performance.now() - lastKickPulse;
-    const pulse = Math.max(0, 1 - since / 220);
-
-    // 接続人数に応じた中央光輪
-    const radius = Math.min(cw, ch) * (0.18 + Math.min(connectedCount, 16) * 0.025) * (1 + pulse * 0.4);
-    const grad = ctx2d.createRadialGradient(cw / 2, ch / 2, 0, cw / 2, ch / 2, radius);
-    grad.addColorStop(0, `rgba(255,180,60,${0.18 + pulse * 0.35})`);
-    grad.addColorStop(1, 'rgba(255,180,60,0)');
-    ctx2d.fillStyle = grad;
-    ctx2d.fillRect(0, 0, cw, ch);
-
-    // パーティクル
+    // パーティクル背景
     for (const p of particles) {
       p.x += p.vx; p.y += p.vy;
       if (p.y < -0.02) { p.y = 1.02; p.x = Math.random(); }
       ctx2d.beginPath();
-      ctx2d.arc(p.x * cw, p.y * ch, p.size * (1 + pulse * 0.6), 0, Math.PI * 2);
+      ctx2d.arc(p.x * cw, p.y * ch, p.size, 0, Math.PI * 2);
       ctx2d.fillStyle = `hsla(${p.hue},80%,70%,${p.alpha})`;
       ctx2d.fill();
     }
+
+    // 接続光点マップ
+    layoutPositions();
+    drawClientDots();
   }
   drawFx();
   </script>
