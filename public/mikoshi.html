@@ -105,11 +105,13 @@
   ];
   const SONG_DURATION_MS = 210000;   // 3:30 per song
 
-  // ─── 現在再生中の曲の状態 (各端末ローカル、サーバー同期なし) ───
+  // ─── 現在再生中の曲の状態 (サーバー指揮、socket 'song_change' で更新) ───
   let _activeSongIdx     = 0;
   let _activeProgression = SONGS[0].progression;
   let _activeBpmBase     = SONGS[0].bpmBase;
   let _activeDrive       = SONGS[0].drive;
+  // 音声初期化前にサーバーから届いた曲番号を保留しておく
+  let _pendingSongIdx    = 0;
 
   // ============================================================
   //  センサー状態
@@ -196,6 +198,13 @@
   const socket = io({ transports: ['websocket'] });
 
   socket.on('joined_mikoshi', (d) => { voiceIndex = d.voiceIndex; });
+
+  // サーバーが曲を切り替えたら追従 (新規接続時にも現在の曲が即届く)
+  socket.on('song_change', ({ songIdx }) => {
+    const idx = ((songIdx % SONGS.length) + SONGS.length) % SONGS.length;
+    _pendingSongIdx = idx;
+    if (audioCtx && _audioRefs) applySong(idx);
+  });
 
   socket.on('world_state', (s) => {
     audienceCount = s.audienceCount;
@@ -1146,11 +1155,8 @@
     // ── ロックグルーヴ自律ループ起動 ──
     startRockGroove(drumBus, guitarAmps, bassAmp);
 
-    // ── 3:30 ごとに次の曲へ循環 (端末ローカル) ──
-    applySong(0);   // 初期曲を反映 (歪み量・ドローン周波数)
-    setInterval(() => {
-      applySong((_activeSongIdx + 1) % SONGS.length);
-    }, SONG_DURATION_MS);
+    // ── 曲切替はサーバー主導: 接続時にサーバーから届いた _pendingSongIdx で初期化 ──
+    applySong(_pendingSongIdx);
 
     // ─── リズムトリガー（加速度ピーク） ───
     // 担ぎ手の動きが大きいときに瞬間的にフィル/オープンハット/クラッシュが入る

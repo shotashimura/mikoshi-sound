@@ -45,7 +45,25 @@ const state = {
   audienceDevices: new Set(),
   audienceEnergy:  new Map(),  // socketId → 群衆エネルギー (0-1)
   voiceIndex: 0,
+
+  // ── 曲の同期: サーバーが指揮 ──
+  // クライアント側の SONGS は現状 4曲。SONG_COUNT を超えた場合は client 側で modulo する。
+  currentSongIdx:   0,
+  songStartTs:      Date.now(),
 };
+
+const SONG_COUNT       = 4;
+const SONG_DURATION_MS = 210000;   // 3:30 per song
+
+setInterval(() => {
+  state.currentSongIdx = (state.currentSongIdx + 1) % SONG_COUNT;
+  state.songStartTs    = Date.now();
+  io.emit('song_change', {
+    songIdx:   state.currentSongIdx,
+    startedAt: state.songStartTs,
+  });
+  console.log(`[song] -> ${state.currentSongIdx}`);
+}, SONG_DURATION_MS);
 
 function computeWorldState() {
   const devices = Array.from(state.mikoshiDevices.values());
@@ -93,6 +111,13 @@ function scheduleBroadcast() {
 // ============================================================
 io.on('connection', (socket) => {
   console.log(`[+] ${socket.id}`);
+
+  // ── 接続直後に現在の曲を送る (mid-song でもすぐ揃う) ──
+  socket.emit('song_change', {
+    songIdx:   state.currentSongIdx,
+    startedAt: state.songStartTs,
+    elapsedMs: Date.now() - state.songStartTs,
+  });
 
   // ── 担ぎ手参加 ──────────────────────────────────────────
   socket.on('join_mikoshi', () => {

@@ -132,6 +132,10 @@
   let _activeSongIdx     = 0;
   let _activeProgression = SONGS[0].progression;
   let _activeDrive       = SONGS[0].drive;
+  // 音声初期化前にサーバーから届いた曲番号を保留
+  let _pendingSongIdx    = 0;
+  // initAudio 完了後にセットされる applySong への参照 (socket リスナーから呼ぶ用)
+  let _audApplySong      = null;
 
   // ============================================================
   //  状態
@@ -169,6 +173,13 @@
 
   socket.on('connect', () => {
     socket.emit('join_audience');
+  });
+
+  // サーバーが曲を切り替えたら追従 (新規接続時にも現在の曲が即届く)
+  socket.on('song_change', ({ songIdx }) => {
+    const idx = ((songIdx % SONGS.length) + SONGS.length) % SONGS.length;
+    _pendingSongIdx = idx;
+    if (_audApplySong) _audApplySong(idx);
   });
 
   socket.on('world_state', (s) => {
@@ -727,10 +738,10 @@
       rampPadToChord(currentChord);
       console.log('[song]', idx, song.name);
     }
-    applySong(0);
-    setInterval(() => {
-      applySong((_activeSongIdx + 1) % SONGS.length);
-    }, SONG_DURATION_MS);
+    // socket リスナーから呼べるように参照を公開
+    _audApplySong = applySong;
+    // 接続時にサーバーから届いた _pendingSongIdx で初期化
+    applySong(_pendingSongIdx);
 
     // ─── ドラムループ (担ぎ手がいるとき疎にビート) ───
     let drumBeat = 0;
