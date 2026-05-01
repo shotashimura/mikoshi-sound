@@ -34,6 +34,15 @@
       letter-spacing: 0.4em;
       animation: blink 2.4s ease-in-out infinite;
     }
+    #tap .note {
+      margin-top: 1.6rem;
+      font-size: 0.65rem;
+      color: rgba(255,200,150,0.45);
+      letter-spacing: 0.18em;
+      text-align: center;
+      max-width: 80%;
+      line-height: 1.7;
+    }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.15} }
 
     #hud {
@@ -78,7 +87,12 @@
   <div id="tap">
     <div class="kanji">神輿</div>
     <div class="hint">タップして開始</div>
+    <div class="note">音が出ない時は本体側面の<br/>サイレントスイッチを OFF にしてください</div>
   </div>
+  <!-- iOS Safari の audio session を Playback カテゴリへ切替えるための無音ループ。
+       silent switch がオンでも Web Audio が鳴るようにするための定番ハック。 -->
+  <audio id="silent-keepalive" playsinline loop preload="auto"
+         src="data:audio/mpeg;base64,SUQzBAAAAAABEVRYWFgAAAAtAAADY29tbWVudABCaWdTb3VuZEJhbmsuY29tIC8gTGFTb25vdGhlcXVlLm9yZwBURU5DAAAAHQAAA1N3aXRjaCBQbHVzIMKpIE5DSCBTb2Z0d2FyZQBUSVQyAAAABgAAAzIyMzUAVFNTRQAAAA8AAANMYXZmNTcuODMuMTAwAAAAAAAAAAAAAAD/80DEAAAAA0gAAAAATEFNRTMuMTAwVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"></audio>
 
   <script src="/socket.io/socket.io.js"></script>
   <script>
@@ -272,14 +286,46 @@
 
   // ============================================================
   //  タップで開始
-  //  iOS では DeviceMotionEvent.requestPermission() が user gesture 内
-  //  でしか呼べないので、initAudio より先に同期的に発火させる。
+  //  iOS Safari は AudioContext の生成と resume をどちらも user gesture
+  //  文脈内で行いたい。一方 DeviceMotionEvent.requestPermission() は
+  //  ネイティブ許可ダイアログを開いて、その間ジェスチャ文脈が失われる
+  //  ので、AudioContext の生成・unlock を先に済ませる。
   // ============================================================
   document.getElementById('tap').addEventListener('pointerdown', async () => {
     document.getElementById('tap').classList.add('gone');
-    initMotion();   // permission request — タップと同じイベント文脈で起動
+    // ① iOS の audio session を Playback カテゴリにする (silent switch 対策)
+    unlockIOSAudioSession();
+    // ② AudioContext を gesture 内で生成 + resume
     await initAudio();
+    // ③ 最後にモーション許可ダイアログ
+    initMotion();
   }, { once: true });
+
+  // ── iOS silent switch 回避: <audio> を loop 再生して session を
+  //    Playback カテゴリに切替える。これで Web Audio が silent mode でも
+  //    出力されるようになる(完全保証ではないが、効果が大きいハック)。
+  function unlockIOSAudioSession() {
+    const a = document.getElementById('silent-keepalive');
+    if (!a) return;
+    try {
+      a.muted = false;
+      a.volume = 0.001;   // 念のため極小、ループ無音mp3 を再生し続ける
+      a.play().catch(() => {});
+    } catch (_) {}
+  }
+
+  // ── visibility / tap 復帰時に AudioContext を確実に resume ──
+  function ensureAudioRunning() {
+    if (audioCtx && audioCtx.state !== 'running') {
+      audioCtx.resume().catch(() => {});
+    }
+    const a = document.getElementById('silent-keepalive');
+    if (a && a.paused) a.play().catch(() => {});
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) ensureAudioRunning();
+  });
+  document.addEventListener('pointerdown', ensureAudioRunning);
 
   // ============================================================
   //  チャリ揺れセンサー (DeviceMotionEvent)
@@ -668,7 +714,12 @@
     audioCtx = new (window.AudioContext || window.webkitAudioContext)({
       latencyHint: 'interactive',
     });
-    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    // iOS では create 直後でも suspended になりがち。確実に resume する。
+    for (let i = 0; i < 3 && audioCtx.state !== 'running'; i++) {
+      try { await audioCtx.resume(); } catch (_) {}
+    }
+    // resume 後の state を反映して HUD を更新
+    audioCtx.addEventListener?.('statechange', () => updateHud());
 
     audioCtxStartWallMs = Date.now() - audioCtx.currentTime * 1000;
 
@@ -1080,17 +1131,21 @@
         : '';
     }
     if (m) {
-      let label = '';
-      if (M.status === 'granted') {
-        label = `🚲 揺れ ON · 集約 ${M.contributors}台`;
-      } else if (M.status === 'requesting') {
-        label = '🚲 センサー許可待ち…';
-      } else if (M.status === 'denied') {
-        label = '🚲 センサー拒否 (リロードで再要求)';
-      } else if (M.status === 'unsupported') {
-        label = '🚲 センサー非対応';
+      const lines = [];
+      // AudioContext state がおかしい場合は最優先で表示
+      if (audioCtx && audioCtx.state !== 'running') {
+        lines.push('⚠️ 音停止中 — 画面をタップ/サイレント解除');
       }
-      m.textContent = label;
+      if (M.status === 'granted') {
+        lines.push(`🚲 揺れ ON · 集約 ${M.contributors}台`);
+      } else if (M.status === 'requesting') {
+        lines.push('🚲 センサー許可待ち…');
+      } else if (M.status === 'denied') {
+        lines.push('🚲 センサー拒否 (リロードで再要求)');
+      } else if (M.status === 'unsupported') {
+        lines.push('🚲 センサー非対応');
+      }
+      m.innerHTML = lines.join('<br/>');
     }
   }
   updateHud();
