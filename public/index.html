@@ -208,6 +208,10 @@
   // 自分の担当ロールを示す 0..1 のレベル (滑らかにフェード)
   const roleLevel  = Object.fromEntries(ROLES.map((r) => [r, r === 'DRUMS' ? 1 : 0]));
   const roleTarget = Object.fromEntries(ROLES.map((r) => [r, 0]));
+  // 同じロールを複数台が保持する時の自分の順位。
+  // -1: そのロール非保有 / 0: 主役 (フルパート) / 1+: 脇役 (装飾のみ)。
+  // 同じ音をフラム重複させないために主と脇の発音内容を分ける。
+  const roleSubIndex = Object.fromEntries(ROLES.map((r) => [r, -1]));
 
   // どのクライアントがどのロールを担当しているか (ビジュアル用)
   // socketId -> { voiceIndex, roles: string[], pulses: { ROLE: lastMs },
@@ -245,6 +249,7 @@
     if (_g) applySongTone(_activeSongIdx);
   });
 
+  let _lastEnsembleN = -1;
   socket.on('clients_update', ({ clients, serverNow }) => {
     if (typeof serverNow === 'number') {
       const sample = serverNow - Date.now();
@@ -254,6 +259,11 @@
     recomputeRoles();
     refreshClientMeta();
     updateHud();
+    // 人数が変わったら歪み量を再評価 (アンサンブル感の調整)
+    if (_g && _lastEnsembleN !== clientsList.length) {
+      _lastEnsembleN = clientsList.length;
+      applySongTone(_activeSongIdx);
+    }
   });
 
   // ─── サーバー集約の連続エネルギー ───
@@ -295,21 +305,28 @@
   //  myI が ROLES.length より大きい場合は myI % ROLES.length で重複担当。
   // ============================================================
   function recomputeRoles() {
-    if (!myId) {
-      for (const r of ROLES) roleTarget[r] = 0;
-      return;
-    }
+    for (const r of ROLES) { roleTarget[r] = 0; roleSubIndex[r] = -1; }
+    if (!myId) return;
     const n = clientsList.length;
+    if (n === 0) return;
     const myI = clientsList.findIndex((c) => c.id === myId);
-    for (const r of ROLES) roleTarget[r] = 0;
-    if (myI < 0 || n === 0) return;
+    if (myI < 0) return;
 
-    const mine = new Set();
-    for (let r = 0; r < ROLES.length; r++) {
-      if (r % n === myI) mine.add(ROLES[r]);
+    // 各ロールの保持者一覧 (clientsList 内の position 順)。
+    // clientsList は全端末で同じ並びなので、保持者リストの先頭を主役、
+    // 残りを脇役とすれば全端末で一致した役割分担になる。
+    for (const role of ROLES) {
+      const holders = [];
+      for (let i = 0; i < n; i++) {
+        const roles = rolesForVoiceIndexInList(clientsList[i].voiceIndex);
+        if (roles.includes(role)) holders.push(i);
+      }
+      const idx = holders.indexOf(myI);
+      if (idx >= 0) {
+        roleTarget[role] = 1;
+        roleSubIndex[role] = idx;
+      }
     }
-    if (mine.size === 0) mine.add(ROLES[myI % ROLES.length]);
-    for (const r of mine) roleTarget[r] = 1;
   }
 
   function rolesForVoiceIndexInList(voiceIndex) {
@@ -511,20 +528,27 @@
     // ── 音響: 担当ロールに応じてアクセント ──
     const when = audioCtx.currentTime + 0.04;
     const m    = Math.max(0, Math.min(1, magnitude));
+    const isPPrim = roleSubIndex.PERCUSSION === 0;
+    const isDPrim = roleSubIndex.DRUMS === 0;
+    const isRPrim = roleSubIndex.RHYTHM === 0;
 
-    // PERCUSSION 担当: オープンハット + 大きいなら splash crash
+    // PERCUSSION 主: オープンハット + 大ピークで crash / 脇: 軽いシェイカーだけ
     const pv = m * roleLevel.PERCUSSION * 0.7;
     if (pv > 0.05) {
-      hitHihat(_g.drumBus, when, pv, true);
-      if (m > 0.55) hitCrash(_g.drumBus, when + 0.01, pv * 0.45);
+      if (isPPrim) {
+        hitHihat(_g.drumBus, when, pv, true);
+        if (m > 0.55) hitCrash(_g.drumBus, when + 0.01, pv * 0.45);
+      } else if (roleSubIndex.PERCUSSION >= 1) {
+        hitHihat(_g.drumBus, when + 0.015, pv * 0.55, false);
+      }
     }
-    // DRUMS 担当: 大きいジョルトでタムフィル
+    // DRUMS 主のみ: 大ジョルトでタムフィル
     const dv = m * roleLevel.DRUMS * 0.55;
-    if (dv > 0.06 && m > 0.45) {
+    if (dv > 0.06 && m > 0.45 && isDPrim) {
       hitTom(_g.drumBus, when, 110 + (1 - m) * 80, dv);
     }
-    // RHYTHM/LEAD: アップストロークで反応 (賑やかし)
-    if (m > 0.6) {
+    // RHYTHM 主のみ: アップストロークで反応 (賑やかし)
+    if (m > 0.6 && isRPrim) {
       const rv = m * roleLevel.RHYTHM * 0.45;
       if (rv > 0.05) {
         const chord = CHORDS[SONGS[_activeSongIdx].progression[0]];
@@ -900,15 +924,25 @@
     updatePlayState();
   }
 
+  // 人数連動で歪みを和らげる係数。複数台が空気中で混ざる時、
+  // 強い distortion は intermod で耳障りになるため、n が増えるほど drive を控える。
+  // n=1: 1.00, n=2: 0.92, n=4: 0.76, n=6: 0.60, n=8+: 0.50 (下限)。
+  function driveFactor() {
+    const n = clientsList.length || 1;
+    return Math.max(0.5, 1.0 - Math.max(0, n - 1) * 0.08);
+  }
+
   function applySongTone(idx) {
     if (!_g) return;
     const song = SONGS[idx];
     const t = audioCtx.currentTime;
     const offs = [-5, 0, -5];
+    const driveK = driveFactor();
     _g.guitarAmps.forEach((amp, i) => {
-      amp.dist.curve = makeDistortionCurve(song.drive + offs[i]);
+      amp.dist.curve = makeDistortionCurve(Math.max(2, (song.drive + offs[i]) * driveK));
       amp.tone.frequency.linearRampToValueAtTime(song.tone, t + 0.6);
-      amp.pres.gain.linearRampToValueAtTime(song.presence, t + 0.6);
+      // presence (中域ピーク) も人数で控えめにしてエッジを丸める
+      amp.pres.gain.linearRampToValueAtTime(song.presence * (0.5 + driveK * 0.5), t + 0.6);
     });
     _g.droneOsc.frequency.linearRampToValueAtTime(song.tonic, t + 1.2);
   }
@@ -1050,6 +1084,15 @@
     const playB = roleLevel.BASS;
     const playR = roleLevel.RHYTHM;
     const playP = roleLevel.PERCUSSION;
+    // 主役 (subIdx=0): フルパート / 脇役 (subIdx>=1): 主とフラムしない装飾だけ。
+    const subD = roleSubIndex.DRUMS;
+    const subB = roleSubIndex.BASS;
+    const subR = roleSubIndex.RHYTHM;
+    const subP = roleSubIndex.PERCUSSION;
+    const isDPrim = subD === 0;
+    const isBPrim = subB === 0;
+    const isRPrim = subR === 0;
+    const isPPrim = subP === 0;
 
     for (let s = 0; s < 16; s++) {
       const tStep = t0 + sixteenthSec * s;
@@ -1067,12 +1110,16 @@
         hatVel = base * (s % 4 === 0 ? 0.85 : 0.55);
         hatOpen = (s === 14 && rng() < 0.30);
       }
-      if (hatStep) {
+      if (isDPrim && hatStep) {
         const v = hatVel * playD;
         if (v > 0.01) hitHihat(drumBus, tStep, v, hatOpen);
+      } else if (subD >= 1 && (s % 2 === 1)) {
+        // DRUMS 脇役: 16分裏のクローズハットだけ刻む (主の8分表とフラムしない)
+        const v = base * 0.40 * playD;
+        if (v > 0.01) hitHihat(drumBus, tStep, v, false);
       }
 
-      // ── キック (DRUMS) ──
+      // ── キック (DRUMS) ── 主役のみ
       let kickHere = false;
       if (feel === 'driving') {
         kickHere = s === 0 || s === 6 || s === 8 || (s === 10 && rng() < 0.5);
@@ -1085,20 +1132,22 @@
         // 全端末でビジュアルパルス & サイドチェイン (ローカルにギター/ベースがあれば効く)
         pulseRoleAt('DRUMS', tStep);
         duckSidechain(tStep);
-        const v = base * playD;
-        if (v > 0.01) hitKick(drumBus, tStep, v);
+        if (isDPrim) {
+          const v = base * playD;
+          if (v > 0.01) hitKick(drumBus, tStep, v);
+        }
       }
 
-      // ── スネア (DRUMS) ──
+      // ── スネア (DRUMS) ── 主役のみ
       let snareHere = false;
       if (feel === 'half') snareHere = s === 8;
       else snareHere = s === 4 || s === 12;
-      if (snareHere) {
+      if (snareHere && isDPrim) {
         const v = base * 0.85 * playD;
         if (v > 0.01) hitSnare(drumBus, tStep, v);
       }
-      // ゴーストスネア (PERCUSSION)
-      if (feel === 'anthemic' && (s === 10 || s === 14) && rng() < 0.30) {
+      // ゴーストスネア (PERCUSSION 主のみ)
+      if (feel === 'anthemic' && (s === 10 || s === 14) && rng() < 0.30 && isPPrim) {
         const v = base * 0.30 * playP;
         if (v > 0.01) {
           hitSnare(drumBus, tStep, v);
@@ -1106,43 +1155,63 @@
         }
       }
 
-      // ── ベース 8分歩き (BASS) ──
+      // ── ベース ──
+      // 主役: 8分歩き / 脇役: 1拍目に1オクターブ上のルートを伸ばす
       if (s % 2 === 0) {
         const beatN = s >> 1;
         const bIdx  = beatN % chord.bassNotes.length;
         const bFreq = chord.bassNotes[bIdx];
         const bvel  = base * (s === 0 ? 0.80 : (s % 4 === 0 ? 0.65 : 0.50));
-        const v = bvel * playB;
-        if (v > 0.01) {
-          playBass(bassAmp, tStep, bFreq, v, sixteenthSec * 1.6);
-          if (s === 0) pulseRoleAt('BASS', tStep);
+        if (isBPrim) {
+          const v = bvel * playB;
+          if (v > 0.01) {
+            playBass(bassAmp, tStep, bFreq, v, sixteenthSec * 1.6);
+            if (s === 0) pulseRoleAt('BASS', tStep);
+          }
+        } else if (subB >= 1 && s === 0) {
+          // 脇: ルートのオクターブ上を 1 小節分伸ばす (主の歩きと音域がぶつからない)
+          const v = base * 0.40 * playB;
+          if (v > 0.01) {
+            playBass(bassAmp, tStep, chord.bassNotes[0] * 2, v, sixteenthSec * 14);
+            pulseRoleAt('BASS', tStep);
+          }
         }
       }
 
       // ── 主ストローク 1拍目 (RHYTHM) ──
+      // 主役: フルストラム / 脇役: トップノートの単音ピックだけ
       if (s === 0) {
-        const v = base * 0.90 * playR;
-        if (v > 0.01) {
-          strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 12, true);
-          pulseRoleAt('RHYTHM', tStep);
+        if (isRPrim) {
+          const v = base * 0.90 * playR;
+          if (v > 0.01) {
+            strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 12, true);
+            pulseRoleAt('RHYTHM', tStep);
+          }
+        } else if (subR >= 1) {
+          const topFreq = chord.voicing[chord.voicing.length - 1];
+          const v = base * 0.50 * playR;
+          if (v > 0.01) {
+            pickGuitar(guitarAmps, tStep, topFreq, v, sixteenthSec * 10);
+            pulseRoleAt('RHYTHM', tStep);
+          }
         }
       }
-      // ── 3拍目アップストローク (RHYTHM) ──
-      if (s === 8) {
+      // ── 3拍目アップストローク (RHYTHM 主のみ) ──
+      if (s === 8 && isRPrim) {
         const v = base * 0.55 * playR;
         if (v > 0.01) {
           strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 6, false);
           pulseRoleAt('RHYTHM', tStep);
         }
       }
-      // ── 8分裏ジャカジャカ (RHYTHM) ──
-      if ((s === 4 || s === 12) && rng() < 0.50) {
+      // ── 8分裏ジャカジャカ (RHYTHM 主のみ) ──
+      if ((s === 4 || s === 12) && rng() < 0.50 && isRPrim) {
         const v = base * 0.30 * playR;
         if (v > 0.01) strumChord(guitarAmps, tStep, chord.voicing, v, sixteenthSec * 4, true);
       }
 
-      // ── タムフィル (PERCUSSION) ──
-      if (measureN % 4 === 3 && s >= 12 && s % 2 === 0 && rng() < 0.55) {
+      // ── タムフィル (PERCUSSION 主のみ) ──
+      if (measureN % 4 === 3 && s >= 12 && s % 2 === 0 && rng() < 0.55 && isPPrim) {
         const v = base * 0.70 * playP;
         if (v > 0.01) {
           const tomFreq = 110 + (s - 12) * 22;
@@ -1150,15 +1219,20 @@
           pulseRoleAt('PERCUSSION', tStep);
         }
       }
-      // ── オープンハット強調 (PERCUSSION) ──
-      if (s === 7 && rng() < 0.25) {
+      // ── オープンハット強調 (PERCUSSION 主のみ) ──
+      if (s === 7 && rng() < 0.25 && isPPrim) {
         const v = base * 0.55 * playP;
         if (v > 0.01) hitHihat(drumBus, tStep, v, true);
       }
+      // ── PERCUSSION 脇役: 16分裏で軽くシェイカー ──
+      if (subP >= 1 && (s % 2 === 1)) {
+        const v = base * 0.28 * playP;
+        if (v > 0.01) hitHihat(drumBus, tStep, v, false);
+      }
     }
 
-    // クラッシュ: 進行ループ頭 (PERCUSSION)
-    if (measureN % song.progression.length === 0) {
+    // クラッシュ: 進行ループ頭 (PERCUSSION 主のみ)
+    if (measureN % song.progression.length === 0 && isPPrim) {
       const v = base * 0.6 * playP;
       if (v > 0.01) {
         hitCrash(drumBus, t0, v);
@@ -1172,10 +1246,24 @@
   function scheduleLeadForMeasure(measureN, t0, sixteenthSec, chord, rng) {
     const lead = chord.lead;
     if (!lead) return;
+    const subL = roleSubIndex.LEAD;
+    const subH = roleSubIndex.HARMONY;
+    if (subL < 0 && subH < 0) return;
     if (roleLevel.LEAD < 0.02 && roleLevel.HARMONY < 0.02) return;
 
     const noteCount = 3 + Math.floor(rng() * 2);
     let leadStep = Math.floor(rng() * 3);
+    const baseVel = 0.40 + Math.min(clientsList.length || 1, 8) * 0.02;
+
+    // LEAD 脇役: 主のメロディと被らないよう、コードトップを 1 小節分パッドで伸ばす
+    if (subL >= 1) {
+      const padFreq = chord.voicing[chord.voicing.length - 1];
+      const padVel = baseVel * 0.45 * roleLevel.LEAD;
+      if (padVel > 0.01) {
+        pickGuitar(_g.guitarAmps, t0, padFreq, padVel, sixteenthSec * 16);
+        pulseRoleAt('LEAD', t0);
+      }
+    }
 
     for (let i = 0; i < noteCount; i++) {
       const stepIdx = 1 + Math.floor((i / noteCount) * 14);
@@ -1189,22 +1277,31 @@
       const isLast = i === noteCount - 1;
       const dur = isLast ? 0.7 + rng() * 0.4 : 0.35 + rng() * 0.25;
 
-      const baseVel = 0.40 + Math.min(clientsList.length || 1, 8) * 0.02;
-
-      // LEAD ロール担当者だけが鳴らす
-      const lvel = baseVel * roleLevel.LEAD;
-      if (lvel > 0.01) {
-        pickGuitar(_g.guitarAmps, tStep, freq, lvel, dur);
-        pulseRoleAt('LEAD', tStep);
+      // LEAD 主役だけがメロディを弾く
+      if (subL === 0) {
+        const lvel = baseVel * roleLevel.LEAD;
+        if (lvel > 0.01) {
+          pickGuitar(_g.guitarAmps, tStep, freq, lvel, dur);
+          pulseRoleAt('LEAD', tStep);
+        }
       }
 
-      // HARMONY ロール: フレーズ最後で 3度下を重ねる
+      // HARMONY ロール: フレーズ最後で重ねる。主=3度下、脇=5度下 (被らない)
       if (isLast && rng() < 0.45) {
-        const harmIdx = Math.max(0, leadStep - 2);
-        const hvel = baseVel * 0.55 * roleLevel.HARMONY;
-        if (hvel > 0.01) {
-          pickGuitar(_g.guitarAmps, tStep + 0.025, lead[harmIdx], hvel, dur * 0.85);
-          pulseRoleAt('HARMONY', tStep + 0.025);
+        if (subH === 0) {
+          const harmIdx = Math.max(0, leadStep - 2);
+          const hvel = baseVel * 0.55 * roleLevel.HARMONY;
+          if (hvel > 0.01) {
+            pickGuitar(_g.guitarAmps, tStep + 0.025, lead[harmIdx], hvel, dur * 0.85);
+            pulseRoleAt('HARMONY', tStep + 0.025);
+          }
+        } else if (subH >= 1) {
+          const harmIdx = Math.max(0, leadStep - 4);
+          const hvel = baseVel * 0.45 * roleLevel.HARMONY;
+          if (hvel > 0.01) {
+            pickGuitar(_g.guitarAmps, tStep + 0.030, lead[harmIdx], hvel, dur * 0.85);
+            pulseRoleAt('HARMONY', tStep + 0.030);
+          }
         }
       }
     }
@@ -1222,7 +1319,13 @@
     if (r) {
       const mine = ROLES.filter((rr) => roleTarget[rr] > 0.5);
       r.innerHTML = mine.length
-        ? '担当: ' + mine.map((rr) => `<span style="color:${ROLE_COLOR[rr]}">${rr}</span>`).join(' / ')
+        ? '担当: ' + mine.map((rr) => {
+            const sub = roleSubIndex[rr];
+            const tag = sub > 0
+              ? `<span style="opacity:0.55;font-size:0.85em;margin-left:0.15em">·副</span>`
+              : '';
+            return `<span style="color:${ROLE_COLOR[rr]}">${rr}</span>${tag}`;
+          }).join(' / ')
         : '';
     }
     if (m) {
