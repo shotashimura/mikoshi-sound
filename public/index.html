@@ -83,11 +83,52 @@
       z-index: 50; font-size: 0.7rem; letter-spacing: 0.4em;
       color: rgba(232,213,160,0.5); pointer-events: none;
     }
+    #play-state {
+      position: fixed; top: 1rem; right: 1rem; z-index: 60;
+      display: flex; flex-direction: column; align-items: flex-end;
+      gap: 0.18rem;
+      padding: 0.5rem 0.9rem;
+      border-radius: 18px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.5s ease, background 0.3s, color 0.3s, border-color 0.3s, box-shadow 0.3s;
+      background: rgba(255, 220, 100, 0.10);
+      border: 1px solid rgba(255, 220, 100, 0.30);
+      color: rgba(255, 220, 100, 0.92);
+      box-shadow: 0 0 22px rgba(255, 200, 80, 0.18);
+    }
+    #play-state.shown { opacity: 1; }
+    #play-state .row {
+      display: flex; align-items: center; gap: 0.45rem;
+      font-size: 0.7rem; letter-spacing: 0.22em;
+    }
+    #play-state .ind {
+      font-size: 0.95rem; line-height: 1;
+      letter-spacing: 0;
+    }
+    #play-state .sub {
+      font-size: 0.52rem;
+      letter-spacing: 0.28em;
+      opacity: 0.55;
+    }
+    #play-state.stopped {
+      background: rgba(120, 140, 180, 0.10);
+      border-color: rgba(150, 175, 220, 0.32);
+      color: rgba(190, 210, 240, 0.92);
+      box-shadow: 0 0 18px rgba(120, 150, 200, 0.18);
+    }
   </style>
 </head>
 <body>
   <canvas id="fx"></canvas>
   <div id="song-name"></div>
+  <div id="play-state">
+    <div class="row">
+      <div class="ind">♪</div>
+      <div class="lbl">再生中</div>
+    </div>
+    <div class="sub">タップで切替</div>
+  </div>
   <div id="hud">
     <div class="count" id="count">— 接続中 —</div>
     <div id="role-line"></div>
@@ -150,6 +191,12 @@
   let audioCtx        = null;
   let serverOffsetMs  = 0;
   let audioCtxStartWallMs = 0;
+
+  // ── 再生 / 停止トグル ──
+  // master gain を 0 / 0.78 で切り替えるだけ。
+  // スケジューラ自体はサーバー同期を維持するために走らせ続ける。
+  const MASTER_VOL = 0.78;
+  let isPlaying = true;
 
   let _activeSongIdx     = 0;
   let _songStartedAtServer = 0;
@@ -336,6 +383,41 @@
     if (!document.hidden) ensureAudioRunning();
   });
   document.addEventListener('pointerdown', ensureAudioRunning);
+
+  // ── 再生 / 停止トグル ──
+  function setPlaying(playing) {
+    isPlaying = !!playing;
+    if (_g && audioCtx) {
+      const t = audioCtx.currentTime;
+      const cur = _g.master.gain.value;
+      _g.master.gain.cancelScheduledValues(t);
+      _g.master.gain.setValueAtTime(cur, t);
+      _g.master.gain.linearRampToValueAtTime(isPlaying ? MASTER_VOL : 0.0001, t + 0.08);
+    }
+    updatePlayState();
+  }
+  function togglePlaying() { setPlaying(!isPlaying); }
+
+  function updatePlayState() {
+    const el = document.getElementById('play-state');
+    if (!el) return;
+    el.classList.add('shown');
+    el.classList.toggle('stopped', !isPlaying);
+    const ind = el.querySelector('.ind');
+    const lbl = el.querySelector('.lbl');
+    if (ind) ind.textContent = isPlaying ? '♪' : '■';
+    if (lbl) lbl.textContent = isPlaying ? '再生中' : '停止中';
+  }
+
+  // ── 画面タップで再生 / 停止トグル ──
+  // 初回 #tap オーバーレイのタップは { once: true } で消費されるので、
+  // ここで拾う pointerdown は 2 回目以降。HUD の motion-line は独自
+  // クリックハンドラを持つので除外。
+  document.addEventListener('pointerdown', (e) => {
+    if (!_g) return;                                    // 初期化前は無視
+    if (e.target && e.target.closest('#motion-line')) return;
+    togglePlaying();
+  });
 
   // ============================================================
   //  チャリ揺れセンサー (DeviceMotionEvent)
@@ -813,6 +895,9 @@
     startScheduler();
     startRoleLerper();
     startHudLoop();
+
+    // 初期化完了 → 再生状態インジケータを表示
+    updatePlayState();
   }
 
   function applySongTone(idx) {
